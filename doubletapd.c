@@ -46,6 +46,7 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/timerfd.h>
 
 #include <linux/input.h>
 
@@ -634,7 +635,12 @@ out:
 /* epoll user-data tag. The inotify fd is still identified by a NULL ptr;
  * everything else leads with one of these so run_loop can tell an evdev
  * device from the analog hidraw node. */
-enum { EP_INPUT = 1, EP_ANALOG = 2 };
+enum { EP_INPUT = 1, EP_ANALOG = 2, EP_LATCH = 3 };
+
+/* The latch-debounce timerfd has no struct of its own; the epoll set is
+ * keyed on a leading discriminator, so it gets a standing one (see
+ * latch_timer_sync). */
+static int g_ep_latch = EP_LATCH;
 
 /* SOCD state for one input source. Per-source, not global: several
  * keyboards are tracked independently even though they share one virtual
@@ -1314,6 +1320,14 @@ typedef struct {
     uint64_t       plant_ns;    /* report time that started the debounce.
                                  * Not a sentinel: regimetest passes 0 on
                                  * every report, so `plant_pending` is. */
+    float          plant_mm[2]; /* latch depths in the latest report while
+                                 * the debounce runs - only for the ARMED
+                                 * log line when the window expires between
+                                 * reports (analog_deep_tick) */
+    int            arm_on_report; /* REPLAY ONLY, never set by the daemon:
+                                   * judge the debounce on reports alone, as
+                                   * the daemon did before it had a timer.
+                                   * See analog_deep_tick. */
 } analog_dev_t;
 
 static analog_dev_t *analog_dev_open(const oid_config_t *cfg,
@@ -1410,7 +1424,18 @@ static void analog_dev_close(analog_dev_t *ad) {
  * than whatever the config says by the time someone replays it. Without
  * that, a trace is only meaningful alongside a copy of the config it was
  * recorded with. The keys are spelled as their config paths, and release_mm
- * is left out because it is derived from actuation_mm, not configured. */
+ * is left out because it is derived from actuation_mm, not configured.
+ *
+ * `# latch_arm=deadline` is the same idea for a rule instead of a number: it
+ * says the daemon this binary is arms the latch when the debounce runs out on
+ * the clock (analog_deep_tick). A trace WITHOUT the line was recorded before
+ * the timer existed, by a daemon that armed on the next report, and `replay`
+ * reproduces it that way. It describes the binary, not the config, so it is
+ * true of the session only while `-T` and the running daemon are the same
+ * build - which is how they are installed. It goes AFTER the `# analog` line
+ * on purpose: readers that only look at the first few header lines keep
+ * finding everything where it was. If the arm rule ever changes again, give
+ * it a new value here rather than reusing this one. */
 static int analog_trace(const oid_config_t *cfg, const char *config_path,
                         const char *input_dir) {
     analog_dev_t *ad = analog_dev_open(cfg, input_dir);
@@ -1447,6 +1472,7 @@ static int analog_trace(const oid_config_t *cfg, const char *config_path,
            (double)a->travel_mm, (double)a->actuation_mm, a->rt_enabled,
            (double)a->rt_press_mm, (double)a->rt_release_mm,
            (double)a->bottom_out_mm, (double)a->latch_debounce_ms);
+    printf("# latch_arm=deadline\n");
     printf("us,k1_mm,k2_mm\n");
     fflush(stdout);
 
@@ -1917,6 +1943,97 @@ static void analog_deep_set(analog_dev_t *ad, int on,
     }
 }
 
+/* The debounce window in whole nanoseconds, rounded UP, and the one place
+ * it is computed. The deadline and the arm test must agree to the
+ * nanosecond: with the deadline truncated and the test left in floating
+ * point, a tick landing exactly on the deadline came up a fraction of a
+ * nanosecond short for any value that is not exact in a float (33.3ms,
+ * 16.7ms) and did not arm. The daemon's timer always fires a little late,
+ * so it never showed there; replay ticks AT the deadline, and stamped the
+ * arm on the next report instead. */
+static uint64_t analog_debounce_ns(const analog_config_t *a) {
+    if (a->latch_debounce_ms <= 0.0f)
+        return 0;
+    double   want = (double)a->latch_debounce_ms * 1e6;
+    uint64_t ns   = (uint64_t)want;
+    return (double)ns < want ? ns + 1 : ns;     /* ceil, without libm */
+}
+
+/* When a running latch debounce runs out, or 0 if none is running (no
+ * plant pending, already armed, or the debounce is off and so never waits).
+ * The daemon arms a timerfd on this; see analog_deep_tick. */
+static int analog_deep_deadline(const analog_dev_t *ad, const oid_config_t *cfg,
+                                uint64_t *deadline_ns) {
+    if (ad->arm_on_report)
+        return 0;
+    if (ad->deep || !ad->plant_pending || cfg->analog.latch_debounce_ms <= 0.0f)
+        return 0;
+    *deadline_ns = ad->plant_ns + analog_debounce_ns(&cfg->analog);
+    return 1;
+}
+
+/* Arm the latch if the debounce has run out at `t_ns`. Shared by the
+ * per-report test and the timer, so both arm identically. */
+static void analog_deep_try_arm(analog_dev_t *ad, const oid_config_t *cfg,
+                                uint64_t t_ns) {
+    const analog_config_t *a = &cfg->analog;
+    if (ad->deep || !ad->plant_pending)
+        return;
+    if (t_ns - ad->plant_ns < analog_debounce_ns(a))
+        return;
+    ad->plant_pending = 0;
+    /* Logged because arming is otherwise INVISIBLE: it is release-only
+     * by construction, it never presses, and the first dip out of it
+     * reverts through two writes the kernel drops. With no trace of it
+     * anywhere, a latch that never arms and a latch that arms and works
+     * look identical from outside - which is exactly the question you
+     * are asking when the daemon seems stuck on the plain remap.
+     * Transitions are once per rock, not per report. */
+    LOG_INFO("Deep latch ARMED: k1 %.2fmm, k2 %.2fmm both at or past "
+             "the backplate (%.2fmm) for %.1fms - SOCD toggle engaged",
+             (double)ad->plant_mm[0], (double)ad->plant_mm[1],
+             (double)(a->travel_mm - a->bottom_out_mm),
+             (double)(t_ns - ad->plant_ns) / 1e6);
+    analog_deep_set(ad, 1, cfg);
+}
+
+/* The debounce window, judged on the clock rather than on the next report.
+ *
+ * The board reports on CHANGE, so two planted, still fingers send nothing at
+ * all. Judging the window only when a report arrived meant a rock that
+ * planted and held never armed until something moved - and if the thing that
+ * moved was the first lift of the rock, one key was already off the floor,
+ * the pending plant was cancelled, and the latch never armed for that rock.
+ * Measured on a user journal at 30ms: mean arm delay 68.6ms, 5% within 5ms of
+ * the setting, plus every rock that silently never armed (issue #12).
+ *
+ * `plant_pending` can only be standing here if the latest report had both
+ * keys on the floor, and any movement off it would itself have been a report,
+ * so "no report since" means "still planted". The daemon calls this from a
+ * timerfd at the deadline; analog_report also calls it with the report's own
+ * time before feeding, so a report that lands after a window the timer has
+ * not yet been serviced for - or the tools, which have no timer - arm first
+ * and then run the report under the toggle, exactly as the daemon would have.
+ * Nothing is emitted here except what analog_deep_set reconciles.
+ *
+ * `arm_on_report` turns all of this off, and exists for one caller: replay,
+ * on a trace recorded by a daemon that had no timer. That daemon judged the
+ * window only inside analog_deep_update, so a still plant armed on the next
+ * report and a rock whose next report was its first lift never armed at all.
+ * That was the defect - but it is also what the player's virtual keys DID in
+ * those sessions, and replaying them under this rule instead moves every arm
+ * earlier and adds latches that never happened. A `-T` trace says which rule
+ * it was played under (`# latch_arm=deadline`, see analog_trace); one that
+ * does not say predates the timer. Both callers come through here, and
+ * analog_deep_deadline reports nothing to wait for, so the flag is the whole
+ * of the old behaviour - analog_deep_update is the same code either way. */
+static void analog_deep_tick(analog_dev_t *ad, const oid_config_t *cfg,
+                             uint64_t t_ns) {
+    if (ad->arm_on_report)
+        return;
+    analog_deep_try_arm(ad, cfg, t_ns);
+}
+
 /* Resolve the `deep` latch for this sample, before the sample's edges are
  * applied.
  *
@@ -1988,22 +2105,9 @@ static void analog_deep_update(analog_dev_t *ad, const oid_config_t *cfg,
         ad->plant_pending = 1;
         ad->plant_ns      = t_ns;
     }
-    if (a->latch_debounce_ms <= 0.0f ||
-        (double)(t_ns - ad->plant_ns) >= (double)a->latch_debounce_ms * 1e6) {
-        ad->plant_pending = 0;
-        /* Logged because arming is otherwise INVISIBLE: it is release-only
-         * by construction, it never presses, and the first dip out of it
-         * reverts through two writes the kernel drops. With no trace of it
-         * anywhere, a latch that never arms and a latch that arms and works
-         * look identical from outside - which is exactly the question you
-         * are asking when the daemon seems stuck on the plain remap.
-         * Transitions are once per rock, not per report. */
-        LOG_INFO("Deep latch ARMED: k1 %.2fmm, k2 %.2fmm both at or past "
-                 "the backplate (%.2fmm) for %.1fms - SOCD toggle engaged",
-                 (double)depth[0], (double)depth[1], (double)floor_mm,
-                 (double)(t_ns - ad->plant_ns) / 1e6);
-        analog_deep_set(ad, 1, cfg);
-    }
+    ad->plant_mm[0] = depth[0];
+    ad->plant_mm[1] = depth[1];
+    analog_deep_try_arm(ad, cfg, t_ns);
 }
 
 /* Route one synthesized edge into the SOCD core under whatever mode the
@@ -2053,6 +2157,11 @@ static void analog_report(analog_dev_t *ad, const oid_config_t *cfg,
      * reverted by a toggle on its way out - the release lands as a plain
      * release, and the reconciliation in analog_deep_set has already put
      * the virtual keys where OFF expects them. */
+    /* A debounce that ran out since the last report arms first, as of now,
+     * so this report is judged under the mode that was already in force for
+     * it. See analog_deep_tick. */
+    analog_deep_tick(ad, cfg, t_ns);
+
     int edges[2][2], ne[2];
     for (int k = 0; k < 2; k++)
         ne[k] = analog_key_feed(&ad->keys, k, depth[k], &cfg->analog,
@@ -2174,6 +2283,28 @@ static void analog_reconcile(analog_dev_t **ad, analog_dev_t **adp,
     LOG_INFO("Analog interface recovered - back on the analog path");
 }
 
+/* Point the latch-debounce timerfd at the analog device's current deadline,
+ * or disarm it. Called after anything that can start, restart or end the
+ * window: every analog drain, every timer expiry, and the device going
+ * away. The deadline is on CLOCK_MONOTONIC, the clock analog_drain stamps
+ * reports with, so the window measured here is the one analog_deep_update
+ * started. */
+static void latch_timer_sync(int tfd, const analog_dev_t *ad,
+                             const oid_config_t *cfg) {
+    if (tfd < 0)
+        return;
+    struct itimerspec its = { 0 };
+    uint64_t          dl;
+    if (ad && analog_deep_deadline(ad, cfg, &dl)) {
+        its.it_value.tv_sec  = (time_t)(dl / 1000000000ull);
+        its.it_value.tv_nsec = (long)(dl % 1000000000ull);
+        if (!its.it_value.tv_sec && !its.it_value.tv_nsec)
+            its.it_value.tv_nsec = 1;      /* zero would disarm it */
+    }
+    if (timerfd_settime(tfd, TFD_TIMER_ABSTIME, &its, NULL) < 0)
+        LOG_WARN("timerfd_settime: %s", strerror(errno));
+}
+
 static int run_loop(dev_list_t *devs, const oid_config_t *cfg,
                     const char *input_dir, analog_dev_t **adp) {
     analog_dev_t *ad = *adp;   /* cleared through adp if it disappears */
@@ -2215,10 +2346,31 @@ static int run_loop(dev_list_t *devs, const oid_config_t *cfg,
         }
     }
 
+    /* The latch debounce has to run out on the clock: the board reports on
+     * change, so planted, still fingers send nothing to judge it by. Only
+     * created with a debounce configured in analog mode, but then kept for
+     * the life of the loop whether or not the board is present, so a
+     * reconnected board needs no setup. Losing
+     * it is not fatal - a still plant then arms on the next report, as it
+     * used to. */
+    int tfd = -1;
+    if (cfg->socd == SOCD_ANALOG && cfg->analog.latch_debounce_ms > 0.0f) {
+        tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+        struct epoll_event ev = { .events = EPOLLIN,
+                                  .data = { .ptr = &g_ep_latch } };
+        if (tfd < 0 || epoll_ctl(epfd, EPOLL_CTL_ADD, tfd, &ev) < 0) {
+            LOG_WARN("latch debounce timer: %s - a still plant will arm on "
+                     "the next report instead", strerror(errno));
+            if (tfd >= 0) close(tfd);
+            tfd = -1;
+        }
+    }
+
     reconcile_devices(devs, cfg, input_dir, epfd, 1);
     if (devs->n == 0) {
         if (ifd < 0) {
             LOG_ERR("Failed to open any input device - aborting");
+            if (tfd >= 0) close(tfd);
             close(epfd);
             return -1;
         }
@@ -2246,6 +2398,21 @@ static int run_loop(dev_list_t *devs, const oid_config_t *cfg,
                 continue;
             }
 
+            if (*(int *)events[i].data.ptr == EP_LATCH) {
+                uint64_t expirations;
+                while (read(tfd, &expirations, sizeof(expirations)) > 0)
+                    ;
+                if (ad) {
+                    struct timespec now;
+                    clock_gettime(CLOCK_MONOTONIC, &now);
+                    analog_deep_tick(ad, cfg,
+                                     (uint64_t)now.tv_sec * 1000000000ull +
+                                     (uint64_t)now.tv_nsec);
+                }
+                latch_timer_sync(tfd, ad, cfg);
+                continue;
+            }
+
             if (*(int *)events[i].data.ptr == EP_ANALOG) {
                 /* The analog board going away is not fatal: release
                  * whatever it held and carry on with the evdev path. */
@@ -2261,6 +2428,7 @@ static int run_loop(dev_list_t *devs, const oid_config_t *cfg,
                     analog_dev_close(ad);
                     ad = *adp = NULL;
                 }
+                latch_timer_sync(tfd, ad, cfg);
                 continue;
             }
 
@@ -2294,6 +2462,7 @@ static int run_loop(dev_list_t *devs, const oid_config_t *cfg,
         }
     }
 
+    if (tfd >= 0) close(tfd);
     if (ifd >= 0) close(ifd);
     close(epfd);
     return 0;

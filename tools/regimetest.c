@@ -574,6 +574,119 @@ int main(void) {
     expect_int("  disarmed", ad.deep, 0);
     cfg.analog.latch_debounce_ms = 0.0f;
 
+    puts("T. latch_debounce_ms runs out on the CLOCK, not on the next report");
+    /* The board reports on change: two planted, still fingers send
+     * nothing. Case S feeds a report every millisecond, which the hardware
+     * does not do; here the plant goes quiet and only the timer is left to
+     * end the window (issue #12). */
+    cfg.analog.latch_debounce_ms = 30.0f;
+    uint64_t dl = 0;
+    fresh();
+    sample_at(0.0, 3.85f, 0.00f);
+    expect_log("k1 planted", "v1+");
+    sample_at(5.0, 3.85f, 3.85f);
+    expect_log("k2 planted, then silence", "v2+");
+    expect_int("  a deadline is running", analog_deep_deadline(&ad, &cfg, &dl), 1);
+    expect_int("  at plant + 30ms", (int)(dl / 1000000ull), 35);
+    reset_log();
+    analog_deep_tick(&ad, &cfg, 34000000ull);
+    expect_int("  timer early by 1ms: still pending", ad.deep, 0);
+    analog_deep_tick(&ad, &cfg, 35000000ull);
+    expect_log("timer at the deadline arms it, v1 steps aside", "v1-");
+    expect_int("  armed with no report", ad.deep, 1);
+    expect_int("  and the deadline is gone", analog_deep_deadline(&ad, &cfg, &dl), 0);
+    sample_at(200.0, 3.85f, 3.00f);
+    expect_log("the first lift of the rock is a beat", "v2- v1+");
+    sample_at(210.0, 0.00f, 0.00f);
+    expect_log("both leave: disarm", "v1-");
+    expect_int("  disarmed", ad.deep, 0);
+
+    /* No timer serviced before the next report - the tools, or an epoll
+     * batch that drains the board before the timer. The window ran out
+     * before this report, so the report must already run under the
+     * toggle; judging the lift first would cancel the plant and lose the
+     * rock, which is the original defect. */
+    fresh();
+    sample_at(0.0, 3.85f, 0.00f);
+    sample_at(5.0, 3.85f, 3.85f);
+    sample_at(200.0, 3.85f, 3.00f);
+    expect_log("lift after the window: arms first, then beats", "v1- v2- v1+");
+    expect_int("  armed", ad.deep, 1);
+
+    /* A key leaving the floor ends the window: nothing for the timer. */
+    fresh();
+    sample_at(0.0, 3.85f, 3.85f);
+    sample_at(10.0, 3.85f, 3.00f);
+    expect_int("  one key left: no deadline",
+               analog_deep_deadline(&ad, &cfg, &dl), 0);
+    analog_deep_tick(&ad, &cfg, 100000000ull);
+    expect_int("  and a late tick does not arm", ad.deep, 0);
+
+    /* A tick exactly ON the deadline arms, for a value that is not exact
+     * in a float too. replay fires its tick there; with the deadline
+     * truncated and the test in floating point this came up short. */
+    cfg.analog.latch_debounce_ms = 33.3f;
+    fresh();
+    sample_at(5.0, 3.85f, 3.85f);
+    expect_int("33.3ms: a deadline is running",
+               analog_deep_deadline(&ad, &cfg, &dl), 1);
+    analog_deep_tick(&ad, &cfg, dl - 1);
+    expect_int("  1ns early: still pending", ad.deep, 0);
+    analog_deep_tick(&ad, &cfg, dl);
+    expect_int("  on the deadline: armed", ad.deep, 1);
+    cfg.analog.latch_debounce_ms = 0.0f;
+
+    /* Debounce off: arming is instantaneous, so nothing ever waits. */
+    fresh();
+    sample_at(0.0, 3.85f, 3.85f);
+    expect_int("debounce 0 arms on the report", ad.deep, 1);
+    expect_int("  and never asks for a timer",
+               analog_deep_deadline(&ad, &cfg, &dl), 0);
+
+    puts("U. arm_on_report: the rule from before the timer, for old traces");
+    /* replay sets this on a trace recorded by a daemon that had no debounce
+     * timer, and it has to reproduce that daemon's defect exactly - the
+     * point is what the player's virtual keys DID in that session, not what
+     * they should have done. These are case T's first two gestures with the
+     * opposite outcomes. */
+    cfg.analog.latch_debounce_ms = 30.0f;
+    fresh();
+    ad.arm_on_report = 1;
+    sample_at(0.0, 3.85f, 0.00f);
+    sample_at(5.0, 3.85f, 3.85f);
+    expect_int("planted, then silence: no deadline to wait for",
+               analog_deep_deadline(&ad, &cfg, &dl), 0);
+    reset_log();
+    analog_deep_tick(&ad, &cfg, 100000000ull);
+    expect_log("a tick long after the window does nothing", "");
+    expect_int("  not armed", ad.deep, 0);
+    sample_at(200.0, 3.85f, 3.00f);
+    expect_log("the first lift is a plain release: the rock never armed",
+               "v2-");
+    expect_int("  still not armed", ad.deep, 0);
+
+    /* It could still arm, but only from a report that found both keys on
+     * the floor after the window - so late, and stamped on that report. */
+    fresh();
+    ad.arm_on_report = 1;
+    sample_at(0.0, 3.85f, 0.00f);
+    sample_at(5.0, 3.85f, 3.85f);
+    sample_at(34.0, 3.85f, 3.86f);
+    expect_int("a report inside the window: still pending", ad.deep, 0);
+    sample_at(72.0, 3.85f, 3.87f);
+    expect_log("a report after it, both still planted: arms there", "v1-");
+    expect_int("  armed", ad.deep, 1);
+    sample_at(200.0, 3.85f, 3.00f);
+    expect_log("  and rides as usual from then on", "v2- v1+");
+
+    /* The flag lives on the device, and a fresh one does not have it. */
+    fresh();
+    sample_at(0.0, 3.85f, 0.00f);
+    sample_at(5.0, 3.85f, 3.85f);
+    expect_int("a fresh device is back on the timer",
+               analog_deep_deadline(&ad, &cfg, &dl), 1);
+    cfg.analog.latch_debounce_ms = 0.0f;
+
     printf("\n%s\n", fails ? "FAILURES ABOVE" : "all assertions passed");
     return fails ? 1 : 0;
 }
