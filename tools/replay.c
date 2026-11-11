@@ -37,6 +37,8 @@
  *   build:  cmake --build build --target replay
  *   usage:  ./build/replay [-c CONFIG] [-e EVENTS.csv] TRACE.csv
  */
+#include <math.h>
+
 #include <libevdev/libevdev.h>
 #include <libevdev/libevdev-uinput.h>
 

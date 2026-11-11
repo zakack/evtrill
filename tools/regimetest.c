@@ -15,11 +15,6 @@
 static void test_emit(unsigned type, unsigned code, int value);
 #define libevdev_uinput_write_event(d, t, c, v) test_emit((t), (c), (v))
 
-/* Capture the voice each report claims, so the cases below can drive the
- * daemon's real analog_report instead of restating its ordering. */
-static void note_voice(int voice);
-#define ANALOG_CLICK(voice) note_voice(voice)
-
 #define main doubletapd_main
 #include "doubletapd.c"
 #undef main
@@ -28,7 +23,6 @@ static void note_voice(int voice);
 #define V2 45   /* KEY_X */
 
 static char log_buf[512];
-static char voice_log[128];
 static int  fails;
 
 /* What the kernel's input core would be holding for v1/v2. Writes that do
@@ -62,24 +56,7 @@ static void test_emit(unsigned type, unsigned code, int value) {
              n ? " " : "", k == 0 ? "v1" : "v2", value ? '+' : '-');
 }
 
-/* Clicks, recorded from what analog_socd_edge returns. Note that a press
- * surviving the emit filter above and a click are equivalent by
- * construction - the click gate in analog_socd_edge suppresses a voice
- * exactly when the press it named was a no-change write - so the emit log
- * doubles as the click log. voice_log pins the gate itself directly. */
-static void note_voice(int voice) {
-    if (voice == VOICE_NONE) return;
-    size_t n = strlen(voice_log);
-    snprintf(voice_log + n, sizeof voice_log - n, "%s%s",
-             n ? " " : "", voice == VOICE_V1 ? "c1" : "c2");
-}
-
-static void reset_log(void) { log_buf[0] = '\0'; voice_log[0] = '\0'; }
-
-/* NB: the expect_* helpers below are deliberately side-effect free, and
- * sample() owns the reset. An earlier version cleared the logs inside
- * expect_log(), which wiped voice_log before expect_clicks() could read it
- * - so every "silent" click assertion passed without testing anything. */
+static void reset_log(void) { log_buf[0] = '\0'; }
 
 static void expect_log(const char *what, const char *want) {
     if (strcmp(log_buf, want) != 0) {
@@ -87,15 +64,6 @@ static void expect_log(const char *what, const char *want) {
         fails++;
     } else {
         printf("  ok   %-48s [%s]\n", what, want[0] ? want : "nothing");
-    }
-}
-
-static void expect_clicks(const char *what, const char *want) {
-    if (strcmp(voice_log, want) != 0) {
-        printf("  FAIL %-48s clicked [%s] want [%s]\n", what, voice_log, want);
-        fails++;
-    } else {
-        printf("  ok   %-48s [%s]\n", what, want[0] ? want : "silent");
     }
 }
 
@@ -191,13 +159,13 @@ static void dfresh(int socd) {
 /* One physical key edge: k == 0 is k1, k == 1 is k2. */
 static void dkey(int k, int value) {
     reset_log();
-    note_voice(socd_apply(&ds, k == 0, value, dcfg.socd, &dcfg));
+    socd_apply(&ds, k == 0, value, dcfg.socd, &dcfg);
 }
 
 /* Press-then-release, for the common "tap a key on its own" shape. */
 static void dtap(int k) {
     reset_log();
-    note_voice(socd_apply(&ds, k == 0, 1, dcfg.socd, &dcfg));
+    socd_apply(&ds, k == 0, 1, dcfg.socd, &dcfg);
     socd_apply(&ds, k == 0, 0, dcfg.socd, &dcfg);
 }
 
@@ -254,7 +222,6 @@ int main(void) {
     expect_int("  still not armed", ad.deep, 0);
     sample(3.20f, 3.85f);
     expect_log("k1 lifts: a plain release, NOT a toggle revert", "v1-");
-    expect_clicks("  and no phantom beat", "");
     sample(0.50f, 3.85f);
     expect_log("k1 gone", "");
     expect_int("  never armed", ad.deep, 0);
@@ -267,7 +234,6 @@ int main(void) {
     expect_log("k2 pressed but not yet down", "v2+");
     sample(3.85f, 3.85f);
     expect_log("k2 reaches the floor: arms, v1 steps aside", "v1-");
-    expect_clicks("  arming itself is silent", "");
     expect_int("  armed", ad.deep, 1);
     expect_int("  exactly one virtual key held", vstate[0] + vstate[1], 1);
 
@@ -276,15 +242,12 @@ int main(void) {
      * only line that means anything while riding is the floor. */
     sample(3.85f, 3.60f);
     expect_log("k2 lifts off the floor: one beat, onto v1", "v2- v1+");
-    expect_clicks("  one click", "c1");
 
     puts("E. rocking: one beat per crossing, alternating");
     sample(3.85f, 3.85f);
     expect_log("k2 returns to the floor", "v1- v2+");
-    expect_clicks("", "c2");
     sample(3.60f, 3.85f);
     expect_log("k1 lifts", "v2- v1+");
-    expect_clicks("", "c1");
 
     puts("F. a finger lifting CLEAR does not disarm - the other is still planted");
     /* The regression this rule exists for, from
@@ -308,14 +271,12 @@ int main(void) {
     expect_log("still short of the floor: still nothing", "");
     sample(3.85f, 3.85f);
     expect_log("reaches the floor - the beat lands there", "v1- v2+");
-    expect_clicks("  on time", "c2");
 
     puts("H. disarms only when BOTH are off the floor, and releases only");
     sample(3.60f, 3.60f);
     expect_log("both leave the backplate", "v2-");
     expect_int("  disarmed", ad.deep, 0);
     expect_int("  nothing left held", vstate[0] + vstate[1], 0);
-    expect_clicks("  and nothing pressed, so nothing clicked", "");
     /* Both keys are now PARKED: live cleared, rt_extreme still at 3.60. The
      * tapping profile judges against actuation_mm (1.00) from here, so a key
      * sitting this deep is exactly where a broken handoff shows up - clear
@@ -362,7 +323,6 @@ int main(void) {
     sample(0.00f, 3.60f);
     expect_log("k2 lifts at the end of the track: slider ends", "v1-");
     expect_int("  disarmed", ad.deep, 0);
-    expect_clicks("  no phantom press for the finger on its way up", "");
     sample(1.50f, 0.00f);
     expect_log("the final circle, tapped at actuation", "v1+");
 
@@ -398,7 +358,6 @@ int main(void) {
     sample(3.85f, 3.85f);
     expect_log("reaches the floor - the beat lands there, not before",
                "v1- v2+");
-    expect_clicks("  one click, on time", "c2");
 
     puts("K. analog_drain agrees with the direct calls, report for report");
     {
@@ -496,8 +455,8 @@ int main(void) {
      * longer (101ms, 116ms) and costs nothing to release.
      *
      * Since the redesign this no longer affects whether a beat lands - every
-     * handover is real either way - but it still decides which voice sounds
-     * first in a burst, so it must stay deterministic. */
+     * handover is real either way - but it still decides which virtual key
+     * leads a burst, so it must stay deterministic. */
     fresh();
     sample(3.85f, 0.00f);
     expect_log("k1 plants first", "v1+");
@@ -580,7 +539,7 @@ int main(void) {
     /* Two hard taps that both graze the floor in one report are an
      * instant; a rock plants and stays. Until the debounce runs out the
      * pair is on the plain remap, so the only cost is that the toggle
-     * engages later - nothing here may press or click on arming. */
+     * engages later - nothing here may press on arming. */
     cfg.analog.latch_debounce_ms = 10.0f;
     fresh();
     sample_at(0.0, 3.85f, 0.00f);
@@ -607,7 +566,6 @@ int main(void) {
     expect_int("  9ms after the restart: still pending", ad.deep, 0);
     sample_at(29.0, 3.85f, 3.85f);
     expect_log("10ms planted: arms, v1 steps aside", "v1-");
-    expect_clicks("  arming is still silent", "");
     expect_int("  armed", ad.deep, 1);
     sample_at(30.0, 3.85f, 3.60f);
     expect_log("riding works as before", "v2- v1+");

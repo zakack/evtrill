@@ -1,8 +1,6 @@
 [Unit]
 Description=doubletap SOCD-cleaning input daemon
 Documentation=https://github.com/zakack/doubletap
-Wants=pipewire.service
-After=pipewire.service wireplumber.service
 
 [Service]
 Type=simple

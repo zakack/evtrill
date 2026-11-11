@@ -10,9 +10,7 @@ rapid-fire, gap-free key alternation on any keyboard.
 Xorg/Wayland ever see the events — applies a SOCD (Simultaneous Opposing
 Cardinal Directions) state machine to two configurable physical keys, and
 re-emits everything through a single virtual uinput keyboard. All other keys
-pass through untouched. It also plays a click sound through PipeWire on every
-virtual keypress, so you get tactile-style audio feedback even on the
-re-pressed key.
+pass through untouched.
 
 ## Features
 
@@ -29,8 +27,7 @@ re-pressed key.
     on the backplate and you get the toggle for rocking, tap and you get
     the plain remap. Adds a software rapid trigger. Requires an analog
     keyboard; see [Analog mode](#analog-mode).
-  - `off` — no SOCD cleaning: k1/k2 are simply remapped to v1/v2, and the
-    audio click still plays on each press.
+  - `off` — no SOCD cleaning: k1/k2 are simply remapped to v1/v2.
 - **Kernel-level grab** — devices are grabbed exclusively via
   `EVIOCGRAB`, so the raw (uncleaned) events never leak to the compositor
   or the game. Works identically under Xorg and Wayland.
@@ -40,10 +37,8 @@ re-pressed key.
   device list.
 - **Multiple keyboards** — each physical keyboard gets its own independent
   SOCD state, all funneled into one virtual output device.
-- **Audio click** — separate WAV samples (16/24/32-bit PCM) played via PipeWire on
-  every virtual key-down, from a dedicated realtime audio thread.
-- **Low latency** — single-threaded epoll loop, best-effort `SCHED_FIFO`
-  realtime scheduling, and `mlockall` when audio is enabled.
+- **Low latency** — single-threaded epoll loop and best-effort `SCHED_FIFO`
+  realtime scheduling.
 
 The whole thing is a single-file C11 daemon (`doubletapd.c`).
 
@@ -52,7 +47,6 @@ The whole thing is a single-file C11 daemon (`doubletapd.c`).
 - Linux with evdev + uinput (any remotely modern kernel)
 - [libevdev](https://www.freedesktop.org/wiki/Software/libevdev/)
 - [libyaml](https://pyyaml.org/wiki/LibYAML)
-- [PipeWire](https://pipewire.org/) (`libpipewire-0.3`)
 - CMake ≥ 3.10, a C11 compiler, and `pkg-config` to build
 
 ## Installation
@@ -73,15 +67,13 @@ cmake --build build
 sudo cmake --install build
 ```
 
-This installs the `doubletapd` binary, the default config and click sample
+This installs the `doubletapd` binary, the default config
 (`/usr/share/doubletap/`), a systemd **user** unit, and a udev rule that
 opens `/dev/uinput` to the `input` group.
 
 ## Setup
 
-`doubletapd` runs as an **unprivileged user service** — not as root. (It
-must not: PipeWire is a per-user session daemon, so a root system service
-would have no audio.)
+`doubletapd` runs as an **unprivileged user service** — not as root.
 
 1. Add yourself to the `input` group (covers read access to
    `/dev/input/event*`; the packaged udev rule opens `/dev/uinput` to the
@@ -129,15 +121,6 @@ keys:                 # physical k1/k2 -> virtual v1/v2
   v1: KEY_Z
   v2: KEY_X
 
-audio:
-  enabled: true
-  wav: /usr/share/doubletap/click.wav   # any 16/24/32-bit PCM WAV
-  gain: 1.0
-  # wav_v1: /usr/share/doubletap/click.wav # optional: separate
-  # wav_v2: /usr/share/doubletap/clack.wav # sound samples and
-  # gain_v1: 1.0                           # gains for v1 & v2
-  # gain_v2: 0.8
-
 uinput:
   name: "doubletap virtual keyboard"
 
@@ -172,7 +155,7 @@ come back up — and the toggle reads that overlap as a rock:
 
 > It answers the outgoing key's release by **re-pressing its virtual key**, a
 > note you never struck.
-> Every overlapped pair costs a spurious click, and the inversion it leaves
+> Every overlapped pair costs a spurious note, and the inversion it leaves
 > behind carries into everything after it.
 
 `off` is right for alt-tapping and useless for rocking, since nothing
@@ -212,10 +195,10 @@ Note what this deliberately does **not** try to do: it never compares one
 key's depth against the other's. One key held deep while the other is
 lightly pressed or tapped is not a problem and is left entirely alone.
 
-#### What you hear
+#### What arming and disarming emit
 
 Arming is **silent**. It releases one virtual key so the toggle's
-one-key-down invariant holds, and emits no press and no click — planting
+one-key-down invariant holds, and emits no press — planting
 your fingers is not a note, and the notes for both keys already landed when
 they bottomed. It leaves exactly one virtual key down, correctly named, so
 every later crossing of the backplate is a plain handover: one beat per lift,
@@ -388,8 +371,6 @@ Handy for trying config changes before restarting the service:
 3. **Re-emit** — everything flows out through one uinput virtual keyboard
    with a full keyboard-wide key set, so hotplugged keyboards with unusual
    keys still work. All other events are mirrored verbatim.
-4. **Click** — each virtual key-down triggers the WAV sample on a PipeWire
-   realtime thread; overlapping triggers restart the sample from the top.
 
 ## Development
 

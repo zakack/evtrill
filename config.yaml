@@ -3,8 +3,7 @@
 # The daemon grabs keyboard devices (auto-discovered, or an explicit list),
 # applies a SOCD-cleaning state machine to two configurable keys
 # (k1/k2 -> v1/v2), and re-emits everything via a single uinput virtual
-# keyboard. It also plays a click sound through PipeWire on every virtual
-# keypress. Devices are hotplug-aware either way: unplugged keyboards are
+# keyboard. Devices are hotplug-aware either way: unplugged keyboards are
 # dropped and re-grabbed when they come back.
 #
 # Copy this file to ~/.config/doubletap/config.yaml and edit it there;
@@ -32,8 +31,7 @@
 #   snappy - "Snappy Tappy" / last input wins: only releasing the ACTIVE
 #            key falls back to the still-held one; releasing the already
 #            suppressed key does nothing.
-#   off    - no SOCD cleaning: k1/k2 are simply remapped to v1/v2
-#            (audio click still plays on each press).
+#   off    - no SOCD cleaning: k1/k2 are simply remapped to v1/v2.
 #   analog - toggle, but driven by how far the keys are actually pressed
 #            rather than by a single fixed actuation point. Requires an
 #            analog keyboard; see the `analog` section below. Falls back to
@@ -47,53 +45,6 @@ keys:
   k2: KEY_X
   v1: KEY_Z
   v2: KEY_X
-
-# Audio click on each virtual keypress, played through PipeWire.
-#
-# `wav` is the base sample and `gain` (linear, 1.0 = unity) the base volume,
-# used for BOTH virtual keys unless overridden per-key below.
-#
-# Per-key overrides let V1 and V2 have their own sound and/or volume:
-#   wav_v1 / wav_v2   - separate samples for the two keys (each falls back
-#                       to `wav` when omitted)
-#   gain_v1 / gain_v2 - separate volumes (each falls back to `gain`)
-# Setting `wav` alongside a single override is fine (not a conflict): the
-# override wins for its key, `wav` covers the other. Point samples at any
-# format libsndfile reads - WAV (any bit depth, including float and
-# WAVE_FORMAT_EXTENSIBLE), FLAC, OGG/Vorbis, Opus and MP3 - at any sample
-# rate and channel count. An osu! skin's hitsounds work as they ship, with no
-# transcoding. The daemon decodes and resamples once at startup so everything
-# shares one output.
-#
-# EVERY click overlaps rather than cutting off the one before it, including
-# two presses of the SAME key. The daemon opens a single output node and
-# mixes internally: each press takes its own voice from a pool of 32, and
-# plays out to its end. This matters most at speed - the shipped click is
-# 125ms and a 300 BPM stream is one tap every 50ms, so anything that
-# restarted playback would clip every note of a burst to 40% and thin out
-# the sound exactly when you are listening hardest.
-#
-# `latency` is the output quantum requested from PipeWire, in frames at 48kHz.
-# Without it the node inherits the graph quantum - 1024 on a stock PipeWire,
-# so a click landed anywhere in a 21ms window and a burst came out unevenly
-# spaced. 256 frames is 5.3ms, and a trigger is placed at the frame it
-# actually fell on within that buffer, so the spacing between two taps
-# survives to the speaker.
-#
-# Lower is not free, and the cost is not local: PipeWire runs the WHOLE graph
-# at the minimum latency any node asks for, so this daemon holds the entire
-# session at whatever you set here for as long as it runs. 256 is right for
-# wired output; a Bluetooth headset or a loaded machine may want 512 or 1024
-# (and will crackle if you insist otherwise). Range 16..8192.
-audio:
-  enabled: true
-  wav: /usr/share/doubletap/click.wav
-  gain: 1.0
-  latency: 256
-  # wav_v1: /usr/share/doubletap/click.wav
-  # wav_v2: /usr/share/doubletap/clack.wav
-  # gain_v1: 1.0
-  # gain_v2: 0.8
 
 # Analog mode (socd: analog). OPTIONAL - ignored by every other mode.
 #
@@ -123,8 +74,8 @@ audio:
 # starts is rapid_trigger.bottom_out_mm, the single most important number
 # here: it defines the latch AND the rapid-trigger bottom-out line.
 #
-# Arming is silent - it emits no press and no click, since the notes for
-# both keys already landed when they bottomed. One key held deep while the
+# Arming is silent - it emits no press, since the notes for both keys
+# already landed when they bottomed. One key held deep while the
 # other is tapped is NOT treated as anything special; the two keys' depths
 # are never compared against each other.
 #

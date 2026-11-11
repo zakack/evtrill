@@ -15,11 +15,15 @@ is a synonym), "snappy" (last input wins, no latching), "analog" (toggle,
 but driven by travel depth read from an analog keyboard), or "off" (no
 cleaning, just the k1/k2 -> v1/v2 remap), selected by the top-level
 `socd` config field — and re-emits all input through a
-single uinput virtual keyboard. It also plays a click sound via PipeWire on
-every virtual keypress. Built for rhythm games (osu!) where fast key
+single uinput virtual keyboard. Built for rhythm games (osu!) where fast key
 alternation needs a "rocking" input pattern instead of naive SOCD handling.
 
-The entire implementation lives in `doubletapd.c` (~3400 lines) — there is
+There is NO audio in this daemon. The PipeWire hitsound subsystem (sampler,
+voice pool, trigger ring) was excised on this branch along with everything
+that existed to serve it — see "What the audio excision took with it" below
+before adding anything that looks like it is missing.
+
+The entire implementation lives in `doubletapd.c` (~2500 lines) — there is
 no multi-module structure.
 
 ## Build
@@ -30,11 +34,7 @@ cmake --build build
 ```
 
 Produces `build/doubletapd`. Requires pkg-config-visible dev packages for
-`libpipewire-0.3`, `libevdev`, `yaml-0.1` (libyaml), `samplerate`
-(libsamplerate — the mixer conforms every sample to one rate at load time;
-PipeWire's own resampler is not linkable from here), and `sndfile`
-(libsndfile — the sample decoder, which is what lets an osu! skin's `.ogg`
-and `.mp3` hitsounds be used as they ship).
+`libevdev` and `yaml-0.1` (libyaml), and nothing else.
 
 There is no test suite, linter, or CI config in this repo — validate changes
 by building and manually exercising the daemon (see Running below).
@@ -44,9 +44,8 @@ by building and manually exercising the daemon (see Running below).
 The daemon is designed to run as an unprivileged user in the `input` group:
 that covers read access to `/dev/input/event*`, and the packaged udev rule
 (`70-doubletap-uinput.rules`) opens `/dev/uinput` to the same group. It
-must NOT run as a root system service — PipeWire is a per-user session
-daemon, so audio only works from inside a user session. The systemd unit
-(`doubletap.service.in`, configured by CMake) is a *user* unit:
+has no need of root and should not be run as a root system service. The
+systemd unit (`doubletap.service.in`, configured by CMake) is a *user* unit:
 `systemctl --user enable --now doubletap`.
 
 ```sh
@@ -56,13 +55,13 @@ daemon, so audio only works from inside a user session. The systemd unit
 Without `-c`, the daemon looks for
 `$XDG_CONFIG_HOME/doubletap/config.yaml` (`~/.config` if unset), then
 falls back to the installed default (`/usr/share/doubletap/config.yaml`;
-CMake bakes the real prefix in via `DEF_CONFIG`/`DEF_WAV` compile
-definitions). See `config.yaml` for the schema: `devices` (optional list of
+CMake bakes the real prefix in via the `DEF_CONFIG` compile definition). See `config.yaml` for the schema: `devices` (optional list of
 `/dev/input/by-id/*` paths; omitted or `auto` means auto-discovery), `socd`
 (`toggle` default, `on` as a synonym, `snappy`, `analog`, or `off`), `keys`
 (k1/k2 physical -> v1/v2 virtual, symbolic `KEY_*` names or numeric codes),
-`audio` (enabled + wav path), `uinput`
-(virtual device name), `analog` (analog-mode thresholds; see below). After
+`uinput` (virtual device name), `analog` (analog-mode thresholds; see
+below). Unknown keys are ignored, so a config that still carries an `audio:`
+section from before the excision loads without complaint. After
 editing config, restart via
 `systemctl --user restart doubletap`. The `-i DIR` flag overrides the
 scanned/watched device directory (default `/dev/input`) — mainly for
@@ -97,10 +96,8 @@ drift; keep it that way.
 `analog_report` is the per-report path — feed, resolve the latch, route
 the edges — split out of `analog_drain` so BOTH tools call the real
 thing. They used to restate that ordering inline, which is precisely the
-drift the `#include` is meant to prevent; keep it that way. The one hook is
-`ANALOG_CLICK`, which regimetest redefines to capture voices (redefining
-`audio_trigger` itself would rewrite that function's own definition, which
-the tools also compile).
+drift the `#include` is meant to prevent; keep it that way. The only thing
+either tool stubs is `libevdev_uinput_write_event`.
 
 `tools/regimetest.c` is the same trick as a unit test — assertions over the
 `deep` latch and its mode transitions, run with `./build/regimetest`; case K
@@ -126,23 +123,7 @@ of each write puts the latch row first. Times count from the first report;
 for an anchored trace the header's `origin_*_ns` place that report on each
 clock. The sweep runs with the stream closed.
 
-`tools/mixtest.c` is the third of these — assertions over the audio voice
-pool, the SPSC trigger ring and the summed output buffer, run with
-`./build/mixtest`. It needs no PipeWire and no stubs: `audio_mix` is the
-whole mixer as a pure function over a float buffer, which is exactly why it
-was factored out of `on_process`. Triggers go in through the real
-`audio_trigger`, since the ring is the thread boundary and that is where the
-bug worth catching lives. Cases C (overlap sums), E (retirement exactly on a
-buffer boundary), G (oldest-steal) and H/I (ring full, ring wrap) are the
-ones that pin the design; L/M cover `sample_conform`; N/O cover sub-buffer
-placement, including its degradations. A–M pass a ZERO timestamp through the
-`trigger()` wrapper, which the drain reads as "no placement information" and
-puts at frame 0 — they predate placement and are the regression gate on the
-mixer proper, so they must keep testing the mixer and not the clock. It cannot see a
-memory-ordering bug — it is single-threaded by construction — so a
-`-fsanitize=thread` run of the daemon is still the check for that.
-
-All three tools build as part of `all`, deliberately: they `#include doubletapd.c`, and
+Both tools build as part of `all`, deliberately: they `#include doubletapd.c`, and
 that guarantee is worthless if the binaries can go stale.
 
 ## Architecture
@@ -198,8 +179,9 @@ sections (search for the `/* --- */` banner comments):
    already-suppressed key emits nothing. Autorepeat (`value == 2`) is
    ignored to avoid corrupting state. `SOCD_OFF` bypasses the state
    machine before any of this: k1/k2 are remapped one-to-one to v1/v2
-   (autorepeat included), presses still return 1 for the audio trigger,
-   and `k1`/`k2` are still tracked so `release_stuck` works.
+   (autorepeat included), and `k1`/`k2` are still tracked so
+   `release_stuck` works. `socd_apply` and `process_event` return nothing:
+   their old return value named the voice to click and had no other reader.
 
 5. **Analog input** (`analog_*`, `hid_map_*`) — optional path used only by
    `socd: analog`. Analog keyboards report per-key travel on a
@@ -242,45 +224,9 @@ sections (search for the `/* --- */` banner comments):
    keeps running with zero devices, waiting for hotplug (it only aborts at
    startup if nothing opened AND inotify is unavailable).
 
-7. **Audio** (`audio_load`, `audio_start`, `audio_trigger`, `audio_mix`,
-   `audio_cleanup` — with `sample_decode`, `sample_conform`,
-   `audio_stream_open`/`_close` and `audio_restart` behind them) —
-   a standard sampler: ONE PipeWire stream, an internal polyphonic mixer,
-   and a fixed pool of voices. The two numbers this separates used to be the
-   same one: how many distinct samples are MAPPED (`AUDIO_NSAMPLES`, two
-   today — V1's click and V2's) and how many sounds can be IN FLIGHT
-   (`AUDIO_MAX_VOICES`, 32). Sixteen mapped keys would still want one output
-   node and a handful of concurrent voices.
-
-   A `mix_voice_t` is a playing INSTANCE — `{samples, nframes, pos, gain,
-   seq, active}`. `audio_mix` drains the trigger ring, walks the active
-   voices summing them into the output buffer, retires the ones that ran
-   out, and clamps. Triggering allocates a voice; it does not touch a
-   stream, so a click never cuts off the one before it — not the other
-   key's, and not an earlier press of the same key. That is the point: the
-   shipped click is 125ms and a 300 BPM stream is one tap every 50ms, so the
-   old per-stream restart truncated every note of a burst at 40%.
-
-   `sample_decode` is a libsndfile wrapper and nothing more — WAV of any bit
-   depth (float and `WAVE_FORMAT_EXTENSIBLE` included), FLAC, OGG/Vorbis,
-   Opus and MP3, normalised to interleaved float; `sample_conform` then brings
-   each sample to `MIX_RATE`/`MIX_CHANNELS` (48kHz stereo) via libsamplerate,
-   once, at startup. Mixing is what forces that — with a stream per sample
-   PipeWire negotiated a format per stream and converted for us; one shared
-   buffer means everything has to agree before it gets there.
-
-   The node requests `PW_KEY_NODE_LATENCY` from `audio.latency` (256 frames
-   = 5.3ms by default) rather than inheriting the graph quantum, and each
-   trigger carries the `CLOCK_MONOTONIC` timestamp of the key event that
-   produced it, so `mix_drain_triggers` can place its voice at the frame it
-   actually fell on. `on_state_changed` does not rebuild anything itself: it
-   raises a flag and pokes an eventfd the epoll loop watches, and
-   `audio_restart` runs the rebuild from there.
-
 `main()` wires these together: parse args -> load config -> attempt
 `SCHED_FIFO` realtime priority (best-effort, warns and falls back on
-failure) -> best-effort audio init (`mlockall` if audio is enabled, to
-avoid page faults in the RT callback) -> build the virtual device (safe
+failure) -> build the virtual device (safe
 before any grab: discovery skips it via `is_doubletap_output`) -> open the
 analog interface if `socd: analog` (before the first reconcile, so grabbed
 keyboards already know their k1/k2 are analog-driven; a failure here just
@@ -342,11 +288,13 @@ down in reverse order.
 - `analog.latch_debounce_ms` WRAPS THE ARM TEST AND NOTHING ELSE. Both
   keys must stay on the backplate for that long, judged on report
   timestamps (`t_ns`, threaded into `analog_deep_update`), before `deep`
-  arms; either key leaving the floor restarts the window. It filters two
+  arms; either key leaving the floor restarts the window. `analog_drain`
+  stamps each report on arrival (`CLOCK_MONOTONIC`; hidraw carries no
+  timestamp), and this is the only reader of that stamp. It filters two
   hard taps that both graze the floor in one report, not a resting finger,
   and it compares no depths across keys. While it runs the pair is still on
   the plain remap, so a long value only delays the toggle; nothing presses
-  or clicks on a late arm. Disarming is never debounced. The pending state
+  on a late arm. Disarming is never debounced. The pending state
   is a flag (`plant_pending`), not `plant_ns == 0`, because `regimetest`
   passes `t_ns = 0` on every report. Default 0 is the old instantaneous
   test, which is what keeps every other case and the corpus unchanged;
@@ -369,7 +317,7 @@ down in reverse order.
   there is no survivor to strand and nothing to press. The older rule could
   fire with the other finger planted deep, so it HAD to press to avoid
   stranding that hold — at the cost of a second note for one lift. Nothing
-  here presses, so nothing here clicks.
+  here presses.
 - DISARMING MUST PARK BOTH FRONT ENDS: `live = 0` with `rt_extreme` left at
   the current depth. A key can be well down at disarm (it need only have
   left the backplate) and the tapping profile is about to judge it against
@@ -398,7 +346,7 @@ down in reverse order.
   19ms after the key-down a note just landed on, short enough for a game to
   miss the press. The older virtual has been down an order of magnitude
   longer and costs nothing to release. It no longer affects whether a beat
-  lands, but it decides which voice sounds first in a burst, so it must
+  lands, but it decides which virtual key leads a burst, so it must
   stay deterministic. `regimetest` case L pins it in both directions.
 - The `S_RELEASE` transition at the first crossing needs no forcing. Both
   keys are still tracked as held (`SOCD_OFF` maintains `socd.k1`/`k2` too),
@@ -440,126 +388,6 @@ down in reverse order.
   finger leaves the floor, and during a real burst every stroke bottoms out
   by definition. Untested in play as of this writing.
 
-## Key invariants to preserve when editing the audio mixer
-
-- THE TRIGGER RING IS THE ONLY STATE SHARED BETWEEN THREADS. Not "the main
-  shared state" — the only one. Every other field the mixer touches is
-  private to one side, which is why there is not an atomic anywhere in
-  `mix_voice_t`. The previous design had four atomics PER STREAM
-  (`playing`/`pending`/`reset`/`frame_pos`) and would have grown four more
-  per sample added; this one does not grow at all.
-- THERE IS EXACTLY ONE PRODUCER, and it is the epoll loop. Both callers of
-  `audio_trigger` — `process_event` and `ANALOG_CLICK` in `analog_report` —
-  run there, single-threaded. The ring's `head`/`tail` protocol is SPSC and
-  is wrong the moment a second thread pushes. If audio ever needs triggering
-  from somewhere else, that is a design change, not a call site.
-- ALLOCATION AND STEALING HAPPEN ON THE CONSUMER SIDE, inside
-  `mix_drain_triggers`. It is tempting to have `audio_trigger` pick the
-  voice, since it already knows the sample — but a producer reaching into
-  the pool would need a per-voice atomic flag to claim a slot, which is
-  precisely the per-stream atomics this design removed. The producer's whole
-  job is to write one byte and bump `head`.
-- `audio_mix` DOES NOT ALLOCATE, LOCK, OR MAKE A SYSCALL. It runs on
-  PipeWire's RT thread. Anything that would (loading a sample, resizing the
-  pool, logging) belongs at startup.
-- SAMPLES ARE CONFORMED AT LOAD, NEVER IN RT. `sample_conform` is the reason
-  mixing is possible at all: one shared output buffer means every sample
-  must already be at `MIX_RATE`/`MIX_CHANNELS` before the callback sees it.
-  `MIX_RATE` is a compile-time constant and must stay one — deriving it from
-  the loaded samples would make the graph's rate depend on which WAV
-  happened to open successfully, and the loader has to know its target
-  before it resamples.
-- `sample_decode` STAYS A PURE DECODER. It returns an interleaved float
-  buffer and reports the file's own rate and channel count; it does not know
-  `MIX_RATE` exists. Folding the conversion back into it would make the
-  conform path untestable without a file on disk, which is what `mixtest`
-  cases L and M rely on. It is a libsndfile wrapper and should stay one — the
-  hand-rolled RIFF reader it replaced accepted only `fmt == 1`, which
-  rejected float32 and `WAVE_FORMAT_EXTENSIBLE` (what ffmpeg and Audacity
-  emit above 16-bit or 2 channels) and could not open an `.ogg` or `.mp3` at
-  all. Verified bit-identical to that reader on the shipped `click.wav`.
-- THE SUBSYSTEM IS ONE REGION WITH FIVE ENTRY POINTS: `audio_load`,
-  `audio_start`, `audio_trigger`, `audio_mix`, `audio_cleanup` (plus
-  `audio_wake_fd`/`audio_restart` for the epoll loop). Sample loading used to
-  sit inline in `main()`, outside the banners. It does not any more, and what
-  is left in `main()` is only what a DIFFERENT program would write
-  differently: which sample id each virtual key means, and where its path and
-  gain came from. Keep new audio work inside the region — the hitsound
-  feature is meant to be liftable out of here as a block.
-- A FULL RING DROPS AND COUNTS. `audio_trigger` never blocks and never
-  spins: it is called from the input path, and a stalled epoll loop costs a
-  keypress, which matters infinitely more than a click. 64 entries against a
-  ~10ms graph quantum is not reachable by human hands; the counter exists to
-  prove that rather than to be acted on.
-- VOICE STEALING TAKES THE OLDEST, by signed `seq` difference so a wrapped
-  counter still orders correctly. Three lines, and unreachable in practice
-  with 32 voices — but a pool that silently dropped the NEWEST trigger would
-  swallow the note you just played, which is the one that matters.
-- THE RESTART FLAG IS CLEARED AFTER THE TEARDOWN, NEVER BEFORE, and this is
-  not defensive: `pw_stream_destroy` EMITS a final `state_changed` whenever
-  the stream was not already unconnected. Measured — a clean SIGTERM reports
-  `paused -> unconnected`, and a rebuild's own close does the same. Clearing
-  first leaves that self-inflicted signal standing, so the next epoll wake
-  tears down the stream just built, forever. `audio.closing` suppresses the
-  log line for teardowns we asked for; the post-close clear plus the eventfd
-  drain is what actually breaks the loop.
-- THE RING IS DISCARDED ON REBUILD (`trig.tail = trig.head`). `audio_trigger`
-  keeps pushing while the stream is dead, so the ring can be full of entries
-  seconds old by the time a new one comes up — every one of which clamps to
-  frame 0 and fires at once. Losing voices across a rebuild is intended; a
-  machine-gun burst of stale ones is worse than losing them.
-- THE REBUILD NEVER RUNS IN A STREAM CALLBACK. `on_state_changed` sets a
-  flag and writes to an eventfd; the epoll loop calls `audio_restart`. A
-  stream cannot be destroyed from inside its own callback, and the failure
-  that forces this is not the obvious one: a sink disappearing errors the
-  node, but the PipeWire DAEMON restarting takes the core with it and
-  surfaces as `UNCONNECTED`, which no amount of `pw_stream_set_active`
-  revives. Both route to the same destroy-and-rebuild, and the loaded samples
-  survive it — only `audio_stream_close` runs, not `audio_cleanup`.
-- STARTUP-FAILURE RETRY IS DELIBERATELY ABSENT. There is no stream to raise a
-  callback when `audio_start` fails, so recovering it needs a timerfd in the
-  epoll loop — a second mechanism for a case a `systemctl --user restart`
-  fixes. `audio_start` warns and the daemon runs silently, as it always did.
-- `audio.latency` IS CONFIG, NOT A CONSTANT, and the reason is that its cost
-  is not local: PipeWire runs the whole graph at the minimum latency any node
-  requests, so this daemon holds the entire session at whatever is set for as
-  long as it runs. Verified at 256: the node AND the output sink both drop to
-  256 frames. Hardcoding it small would be picking a fight with every
-  Bluetooth headset on the user's behalf.
-- `AUDIO_NSAMPLES` AND `AUDIO_MAX_VOICES` ARE DIFFERENT NUMBERS and must
-  stay that way. They were the same number in the old per-stream design and
-  that is exactly what made overlapping clicks impossible. Adding per-key
-  samples means growing the first alone.
-- THE OUTPUT IS SUMMED IN FLOAT AND CLAMPED. No limiter, no per-voice
-  ducking: with realistic overlap the clamp never engages, and a click is
-  not worth a compressor. If a test's expected value comes back exactly
-  1.0, suspect the fixture's amplitudes before suspecting the mixer.
-- A TRIGGER IS PLACED AT THE FRAME IT FELL ON, not at the start of the next
-  buffer. The ring entry carries the event's `CLOCK_MONOTONIC` timestamp and
-  the voice carries a `start_off`; `mix_drain_triggers` maps the window
-  `[cycle_ns - nframes, cycle_ns)` onto `[0, nframes)`. This was a non-goal
-  right up until the node stopped inheriting a 1024-frame quantum: dropping
-  everything at frame 0 quantises every burst to the graph quantum, so
-  identical taps came out up to 21ms apart. It buys that back for ONE FIXED
-  QUANTUM of added latency, which is the trade on purpose — a constant
-  latency is something hands adapt to and jitter is something you hear.
-- THE PLACEMENT MATH ROUNDS, and degrades toward frame 0. A frame is 20833ns
-  at 48kHz, so truncating puts a timestamp exactly N frames back at N-1 and
-  biases every voice one frame late — a systematic error in the one direction
-  this path exists to remove. A stale trigger (a backlog, a stalled loop)
-  clamps to 0 and plays at once; a timestamp from the future clamps to the
-  last frame; a missing `cycle_ns` or `t_ns` means frame 0. It never drops a
-  voice for being badly timed. `mixtest` case O pins all four.
-- THE TIMESTAMP IS ONLY MEANINGFUL BECAUSE BOTH INPUT PATHS ARE ON
-  `CLOCK_MONOTONIC`. evdev stamps `CLOCK_REALTIME` by default, so
-  `input_try_open` calls `libevdev_set_clock_id` — through libevdev, NOT a
-  raw `EVIOCSCLOCKID` ioctl, because libevdev keeps its own `clock_id` to
-  stamp the events it synthesises during `SYN_DROPPED` resync and an ioctl
-  behind its back leaves those on REALTIME. hidraw carries no timestamp at
-  all, so `analog_drain` stamps each report on arrival. Getting this wrong is
-  SILENT: the two epochs differ by decades, every age clamps, and every
-  trigger quietly reverts to frame 0.
-
 ## Key invariants to preserve when editing `process_event`
 
 - `k1`/`k2`/`act` state lives in a `socd_state_t` owned by each input
@@ -576,3 +404,40 @@ down in reverse order.
   configured device name) — every path that opens an input device has to
   keep going through this guard, in explicit mode too, or emitted events
   feed straight back in as input (infinite feedback loop).
+
+## What the audio excision took with it
+
+The daemon used to play a hitsound on every virtual key-down: one PipeWire
+stream, a 32-voice mixer, an SPSC trigger ring, libsndfile decoding and
+libsamplerate conforming. All of it is gone, and so is everything that
+existed only to feed it. None of the following is an accident, and none of
+it should be "restored" without restoring audio itself:
+
+- NO VOICE RETURN VALUES. `socd_apply`, `process_event` and
+  `analog_socd_edge` are `void`. They used to return `VOICE_V1`/`VOICE_V2`
+  so the caller could trigger a sample.
+- NO CLICK GATE IN `analog_socd_edge`. It computed the virtual picture
+  before and after each edge to suppress a click whose press the kernel
+  would drop as a no-change write. With nothing to click, the function is
+  the mode selection, `last_press`, and one `socd_apply` call.
+- NO `ANALOG_CLICK` HOOK, and `regimetest` has no `expect_clicks`. Every
+  click assertion sat directly after an `expect_log` on the same report, and
+  a press surviving the harness's no-change filter was equivalent to a click
+  by construction, so the emit log already pins all of it.
+- EVDEV IS BACK ON ITS DEFAULT CLOCK. `input_try_open` no longer calls
+  `libevdev_set_clock_id(CLOCK_MONOTONIC)`: that existed so a trigger could
+  be placed at the frame its key event fell on. Nothing reads
+  `input_event.time` now. Analog reports are still stamped on arrival,
+  because the latch debounce reads that.
+- NO `mlockall`. It was there to keep the RT audio callback from page
+  faulting. `SCHED_FIFO` stays; it serves the input path.
+- NO EVENTFD IN THE EPOLL SET, and no `EP_AUDIO` tag. The loop multiplexes
+  input devices, the analog hidraw node, and inotify — nothing else.
+- NO `<stdatomic.h>`, AND NO SECOND THREAD. The trigger ring was the only
+  state shared across threads; the daemon is single-threaded again, full
+  stop.
+- `<time.h>` AND (in `tools/replay.c`) `<math.h>` ARE INCLUDED EXPLICITLY.
+  Both had been arriving through the PipeWire headers.
+- `tools/mixtest.c`, `click.wav`, the `DEF_WAV` definition, the `audio`
+  config section and its parser, and the unit's `Wants=`/`After=` on
+  `pipewire.service` are all removed.

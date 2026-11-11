@@ -9,9 +9,8 @@
  * last input wins, "analog" = toggle and off switched at runtime by how
  * far the keys are pressed, or "off" = plain remap with no cleaning, per
  * the config's socd field) to two configurable physical
- * keys (k1, k2 -> v1, v2), mirrors every other event verbatim into a
- * single uinput virtual keyboard, and plays a click sound through
- * PipeWire on every virtual key-press.
+ * keys (k1, k2 -> v1, v2), and mirrors every other event verbatim into a
+ * single uinput virtual keyboard.
  *
  * In analog mode the keyboard's travel depth is read straight off its
  * vendor HID interface and the `deep` latch decides which machine is in
@@ -32,7 +31,6 @@
 #include <signal.h>
 #include <sched.h>
 #include <stdarg.h>
-#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -40,6 +38,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <sys/epoll.h>
@@ -47,20 +46,13 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/eventfd.h>
-#include <sys/mman.h>
 
 #include <linux/input.h>
 
 #include <libevdev/libevdev.h>
 #include <libevdev/libevdev-uinput.h>
 
-#include <samplerate.h>
-#include <sndfile.h>
 #include <yaml.h>
-
-#include <spa/param/audio/format-utils.h>
-#include <pipewire/pipewire.h>
 
 /* ------------------------------------------------------------------------- */
 /* Defaults                                                                  */
@@ -72,10 +64,7 @@
 #define DEF_V2     KEY_F14
 #define DEF_NAME   "doubletap virtual keyboard"
 
-/* Installed data paths; CMake overrides these to match the install prefix. */
-#ifndef DEF_WAV
-#define DEF_WAV    "/usr/share/doubletap/click.wav"
-#endif
+/* Installed data path; CMake overrides this to match the install prefix. */
 #ifndef DEF_CONFIG
 #define DEF_CONFIG "/usr/share/doubletap/config.yaml"
 #endif
@@ -122,672 +111,6 @@ static void on_signal(int sig) {
     g_running = 0;
 }
 
-/* ------------------------------------------------------------------------- */
-/* Audio (PipeWire)                                                          */
-/* ------------------------------------------------------------------------- */
-
-static int audio_available;
-
-/* The mixer's internal format. FIXED at compile time rather than derived
- * from whatever loaded: the WAV loader has to know its resampling target
- * before it runs, and deriving the rate from "the first sample that opened
- * successfully" would make the graph's rate depend on which load failed.
- * 48kHz is PipeWire's default graph rate, so the shipped click costs
- * nothing to play. */
-#define MIX_RATE     48000
-#define MIX_CHANNELS 2
-
-/* Requested node quantum, in frames at MIX_RATE. Without a node.latency the
- * stream inherits the graph quantum, which is 1024 on a stock PipeWire - so
- * a click landed anywhere in a 21ms window. 256 frames is 5.3ms.
- *
- * Overridable from config rather than fixed, because a node.latency is a
- * request the graph honours by running EVERY node at the minimum of all of
- * them: a session-long daemon asking for 256 drags the whole graph down for
- * as long as it runs. That is the right default for a rhythm game on wired
- * output and the wrong one for a Bluetooth headset. */
-#define AUDIO_LATENCY_DEFAULT 256
-
-/* Distinct mapped samples. Two today (V1's click and V2's), but the table is
- * indexed by sample id and nothing below counts on the 2: how many samples
- * are MAPPED and how many sounds can be IN FLIGHT are different numbers now,
- * which is the whole point of the voice pool. */
-#define AUDIO_NSAMPLES 2
-
-/* Concurrent sounds. Far more than a pair of fingers can ask for; the pool
- * is ~1KB static and exhaustion is a formality (see mix_voice_alloc). */
-#define AUDIO_MAX_VOICES 32
-
-/* Trigger ring depth. Power of two, indexed by free-running counters. */
-#define TRIG_RING 64
-
-/* process_event() return codes: which virtual key it emitted a press for
- * (and thus which hitsound sample to trigger). 0 = no press this event. */
-#define VOICE_NONE 0
-#define VOICE_V1   1
-#define VOICE_V2   2
-
-/* A loaded, CONFORMED sample: interleaved float at MIX_RATE/MIX_CHANNELS.
- * All rate and channel conversion happened at load time, so nothing in the
- * RT callback has to know what the file on disk looked like. */
-typedef struct {
-    float  *samples;
-    size_t  num_frames;
-    float   gain;        /* linear multiplier, 1.0 = unity */
-} audio_sample_t;
-
-/* A PLAYING INSTANCE of a sample. This is the thing a keypress allocates.
- * Owned exclusively by the RT thread - only audio_mix() ever reads or writes
- * one - which is why there is not an atomic in sight here. */
-typedef struct {
-    const float *samples;   /* borrowed from audio.sample[]; RT never frees */
-    size_t       nframes;
-    size_t       pos;
-    size_t       start_off; /* frames into its FIRST buffer; 0 thereafter */
-    float        gain;
-    uint32_t     seq;       /* allocation order, for oldest-steal */
-    bool         active;
-} mix_voice_t;
-
-static struct {
-    struct pw_thread_loop *loop;
-    struct pw_stream      *stream;    /* ONE node, whatever is mapped */
-    audio_sample_t         sample[AUDIO_NSAMPLES];
-    mix_voice_t            voice[AUDIO_MAX_VOICES];
-    uint32_t               seq_next;  /* RT-thread private, like the pool */
-    unsigned               latency;   /* requested quantum, frames */
-    int                    wakefd;    /* eventfd: RT/thread-loop -> epoll */
-    atomic_int             restart;   /* set by state_changed, read by epoll */
-    atomic_int             closing;   /* teardown in progress: ignore states */
-} audio;
-
-/* The ONLY state shared between the epoll thread and the RT thread.
- * Single-producer/single-consumer: the producer is the epoll loop and only
- * the epoll loop (process_event and ANALOG_CLICK both run there), the
- * consumer is audio_mix(). head and tail free-run and wrap; the unsigned
- * difference is the fill level. */
-static struct {
-    struct {
-        uint8_t  sample;           /* sample index */
-        uint64_t t_ns;             /* CLOCK_MONOTONIC, when the key moved */
-    }           e[TRIG_RING];
-    atomic_uint head;              /* producer writes */
-    atomic_uint tail;              /* consumer writes */
-    atomic_uint overruns;          /* triggers dropped on a full ring */
-} trig;
-
-/* Pure decoder: a file on disk in, interleaved float out. Knows nothing about
- * the mix format - conforming to it is sample_conform's job, kept separate so
- * the loader stays testable against a buffer with no file behind it.
- *
- * libsndfile rather than a hand-rolled RIFF reader. The reader this replaced
- * accepted only fmt == 1, which rejected float32 WAVs and WAVE_FORMAT_EXTENSIBLE
- * - what ffmpeg and Audacity emit above 16-bit or 2 channels - and could not
- * read .ogg or .mp3 at all. osu! skins ship all three, and a sampler that makes
- * you transcode your own skin before it will play is the wrong trade for ninety
- * lines of chunk parsing. One dependency covers WAV/FLAC/OGG/Opus/MP3.
- *
- * sf_readf_float normalises every format to [-1, 1] for us, so the bit-depth
- * conversion ladder goes with the parser. */
-static float *sample_decode(const char *path, size_t *frames_out,
-                            int *ch_out, int *rate_out) {
-    SF_INFO   si = { 0 };
-    SNDFILE  *sf = sf_open(path, SFM_READ, &si);
-    if (!sf) {
-        LOG_WARN("Cannot open sample %s: %s", path, sf_strerror(NULL));
-        return NULL;
-    }
-    if (si.frames <= 0 || si.channels <= 0 || si.samplerate <= 0) {
-        LOG_WARN("Empty or unreadable sample: %s", path);
-        sf_close(sf);
-        return NULL;
-    }
-
-    size_t frames = (size_t)si.frames;
-    float *out = calloc(frames * (size_t)si.channels, sizeof(float));
-    if (!out) { sf_close(sf); LOG_ERR("oom"); return NULL; }
-
-    sf_count_t got = sf_readf_float(sf, out, si.frames);
-    sf_close(sf);
-    if (got <= 0) {
-        LOG_WARN("Decoded no frames from %s", path);
-        free(out);
-        return NULL;
-    }
-    /* A short read is not fatal - a truncated file still plays what it has -
-     * but the buffer has to agree with what was actually decoded. */
-    if (got < si.frames)
-        LOG_WARN("%s: expected %lld frames, decoded %lld",
-                 path, (long long)si.frames, (long long)got);
-    frames = (size_t)got;
-
-    LOG_INFO("Loaded %s: %zu frames, %d ch, %d Hz",
-             path, frames, si.channels, si.samplerate);
-
-    *frames_out = frames;
-    *ch_out     = si.channels;
-    *rate_out   = si.samplerate;
-    return out;
-}
-
-/* Bring a decoded buffer to MIX_RATE/MIX_CHANNELS. Does NOT take ownership
- * of `in`; the caller frees it either way.
- *
- * Mixing is what forces this: with a stream per sample, PipeWire negotiated
- * a format per stream and converted for us. One shared output buffer means
- * every sample has to already agree on rate and channel count by the time it
- * reaches the callback. Doing it here is offline startup work and strictly
- * better for latency than converting on the graph every cycle. */
-static int sample_conform(const float *in, size_t frames, int ch, int rate,
-                          audio_sample_t *out) {
-    if (!in || frames == 0 || ch <= 0 || rate <= 0) return -1;
-
-    /* 1. Channels. Mono is duplicated rather than left to PipeWire, since
-     *    the mix buffer is a single interleaved layout by then. */
-    float *lay = calloc(frames * MIX_CHANNELS, sizeof(float));
-    if (!lay) return -1;
-    if (ch == 1) {
-        for (size_t i = 0; i < frames; i++)
-            lay[i * 2] = lay[i * 2 + 1] = in[i];
-    } else {
-        if (ch > MIX_CHANNELS)
-            LOG_WARN("Sample has %d channels; using the first %d",
-                     ch, MIX_CHANNELS);
-        for (size_t i = 0; i < frames; i++) {
-            lay[i * 2]     = in[i * (size_t)ch];
-            lay[i * 2 + 1] = in[i * (size_t)ch + 1];
-        }
-    }
-
-    /* 2. Rate. */
-    if (rate == MIX_RATE) {
-        out->samples    = lay;
-        out->num_frames = frames;
-        return 0;
-    }
-
-    double ratio = (double)MIX_RATE / (double)rate;
-    if (!src_is_valid_ratio(ratio)) {
-        LOG_WARN("Cannot resample %d Hz to %d Hz", rate, MIX_RATE);
-        free(lay);
-        return -1;
-    }
-
-    /* Headroom, not a tight bound: src_simple stops at output_frames and a
-     * cap sitting exactly on the arithmetic answer clips the sinc tail. */
-    size_t cap = (size_t)(frames * ratio) + 16;
-    float *res = calloc(cap * MIX_CHANNELS, sizeof(float));
-    if (!res) { free(lay); return -1; }
-
-    SRC_DATA d = {
-        .data_in       = lay,
-        .input_frames  = (long)frames,
-        .data_out      = res,
-        .output_frames = (long)cap,
-        .src_ratio     = ratio,
-    };
-    int err = src_simple(&d, SRC_SINC_BEST_QUALITY, MIX_CHANNELS);
-    free(lay);
-    if (err) {
-        LOG_WARN("Resample failed: %s", src_strerror(err));
-        free(res);
-        return -1;
-    }
-
-    LOG_INFO("Resampled %d Hz -> %d Hz: %zu -> %ld frames",
-             rate, MIX_RATE, frames, d.output_frames_gen);
-    out->samples    = res;
-    out->num_frames = (size_t)d.output_frames_gen;
-    return 0;
-}
-
-/* Decode `path`, conform it to the mix format, and map it as sample `idx`.
- *
- * This lives here rather than in main() on purpose: it is the last piece of
- * the audio subsystem that used to sit outside the banners, so everything
- * between them is now the whole of it - load, start, trigger, mix, cleanup.
- * What stays the caller's business is which sample id means what and where
- * the paths and gains came from, which is exactly the part that differs
- * between one program and the next. */
-static int audio_load(int idx, const char *path, float gain) {
-    if (idx < 0 || idx >= AUDIO_NSAMPLES || !path) return -1;
-
-    size_t frames; int ch, rate;
-    float *raw = sample_decode(path, &frames, &ch, &rate);
-    if (!raw) return -1;
-
-    int rc = sample_conform(raw, frames, ch, rate, &audio.sample[idx]);
-    free(raw);
-    if (rc != 0) return -1;
-
-    audio.sample[idx].gain = gain;
-    return 0;
-}
-
-/* Take a voice for `s`. RT side, called only from the ring drain.
- *
- * Allocating here rather than in audio_trigger is deliberate and is what
- * keeps the pool atomic-free: a producer that reached into the pool would
- * need a per-voice flag to claim a slot, which is exactly the per-stream
- * atomics this design removes. */
-static void mix_voice_alloc(const audio_sample_t *s, size_t start_off) {
-    if (!s->samples || s->num_frames == 0) return;
-
-    mix_voice_t *v = NULL;
-    for (int i = 0; i < AUDIO_MAX_VOICES; i++) {
-        if (!audio.voice[i].active) { v = &audio.voice[i]; break; }
-    }
-    if (!v) {
-        /* Steal the oldest. Signed difference so a wrapped seq still orders
-         * correctly. Three lines, and in practice unreachable: 32 voices is
-         * far more overlap than two fingers can ask for. */
-        v = &audio.voice[0];
-        for (int i = 1; i < AUDIO_MAX_VOICES; i++)
-            if ((int32_t)(audio.voice[i].seq - v->seq) < 0)
-                v = &audio.voice[i];
-    }
-
-    v->samples = s->samples;
-    v->nframes = s->num_frames;
-    v->gain    = s->gain;
-    v->pos       = 0;
-    v->start_off = start_off;
-    v->seq       = audio.seq_next++;
-    v->active    = true;
-}
-
-/* Drain the trigger ring into the voice pool, placing each voice at its own
- * frame within this buffer.
- *
- * WHY SUB-BUFFER PLACEMENT. Dropping every trigger at frame 0 is minimum
- * latency, but the events being drained arrived at any point across the
- * previous cycle, so identical taps come out up to a whole quantum apart. On
- * a rhythm-game hitsound that jitter is the thing you hear; a constant
- * latency is the thing hands adapt to. So a trigger is placed where it
- * actually fell within the cycle, which costs one fixed quantum and returns
- * an even burst.
- *
- * `cycle_ns` is the monotonic time of THIS cycle, and the events being
- * drained fall in [cycle_ns - nframes, cycle_ns). Mapping that window onto
- * [0, nframes) is the line below. Anything older - a backlog, a stalled loop -
- * clamps to 0 and plays at once, which is the right way to fall over. */
-static void mix_drain_triggers(uint64_t cycle_ns, size_t nframes) {
-    unsigned t = atomic_load_explicit(&trig.tail, memory_order_relaxed);
-    unsigned h = atomic_load_explicit(&trig.head, memory_order_acquire);
-
-    for (; t != h; t++) {
-        unsigned s     = trig.e[t & (TRIG_RING - 1)].sample;
-        uint64_t t_ns  = trig.e[t & (TRIG_RING - 1)].t_ns;
-        if (s >= AUDIO_NSAMPLES) continue;
-
-        size_t off = 0;
-        if (cycle_ns && t_ns && nframes) {
-            int64_t age = (int64_t)cycle_ns - (int64_t)t_ns;
-
-            /* Bound before multiplying: age is attacker-free but not
-             * bounded (a wrong clock, a device stamping garbage), and
-             * age * MIX_RATE overflows int64 past about a week. Anything
-             * over a second is stale by every measure that matters. */
-            if (age > 1000000000) age = 1000000000;
-            if (age < 0)          age = 0;
-
-            /* ROUNDED, not truncated. A frame is 20833.3ns at 48kHz, so a
-             * timestamp exactly N frames back truncates to N-1 and lands
-             * every voice a frame late - small, but a systematic bias in
-             * the one direction this whole path exists to remove. */
-            int64_t back = (age * MIX_RATE + 500000000) / 1000000000;
-            int64_t o    = (int64_t)nframes - back;
-            if (o < 0)                    o = 0;
-            if (o > (int64_t)nframes - 1) o = (int64_t)nframes - 1;
-            off = (size_t)o;
-        }
-        mix_voice_alloc(&audio.sample[s], off);
-    }
-
-    atomic_store_explicit(&trig.tail, t, memory_order_release);
-}
-
-/* Render `nframes` of MIX_CHANNELS-interleaved float. The entire mixer, with
- * no PipeWire in it - tools/mixtest.c calls this directly.
- *
- * No malloc, no lock, no syscall: everything it touches is either the ring
- * (two atomics) or the RT thread's own pool. */
-static void audio_mix(float *dst, size_t nframes, uint64_t cycle_ns) {
-    size_t nsamp = nframes * MIX_CHANNELS;
-
-    mix_drain_triggers(cycle_ns, nframes);
-    memset(dst, 0, nsamp * sizeof *dst);
-
-    for (int i = 0; i < AUDIO_MAX_VOICES; i++) {
-        mix_voice_t *v = &audio.voice[i];
-        if (!v->active) continue;
-
-        /* start_off is the voice's placement within its FIRST buffer only:
-         * it delays where the copy begins and shortens what fits, and is
-         * cleared below so every later buffer starts at frame 0. */
-        size_t off = v->start_off;
-        if (off >= nframes) { v->start_off = off - nframes; continue; }
-        v->start_off = 0;
-
-        size_t room = nframes - off;
-        size_t rem  = v->nframes - v->pos;
-        size_t n    = room < rem ? room : rem;
-
-        const float *src = v->samples + v->pos * MIX_CHANNELS;
-        float *out = dst + off * MIX_CHANNELS;
-        float g = v->gain;
-        for (size_t k = 0; k < n * MIX_CHANNELS; k++)
-            out[k] += src[k] * g;
-
-        v->pos += n;
-        if (v->pos >= v->nframes) v->active = false;
-    }
-
-    /* Sum into float, then clamp. With realistic overlap this never
-     * engages; a proper limiter would be over-engineering for a click. */
-    for (size_t k = 0; k < nsamp; k++) {
-        if (dst[k] >  1.0f) dst[k] =  1.0f;
-        else if (dst[k] < -1.0f) dst[k] = -1.0f;
-    }
-}
-
-static void on_process(void *userdata) {
-    (void)userdata;
-    struct pw_buffer *b;
-
-    if ((b = pw_stream_dequeue_buffer(audio.stream)) == NULL) {
-        pw_log_warn("out of buffers: %m");
-        return;
-    }
-
-    struct spa_buffer *buf = b->buffer;
-    float *dst = buf->datas[0].data;
-    if (!dst) { pw_stream_queue_buffer(audio.stream, b); return; }
-
-    int stride = (int)(sizeof(float) * MIX_CHANNELS);
-    int n_frames = buf->datas[0].maxsize / stride;
-    if (b->requested)
-        n_frames = SPA_MIN((int)b->requested, n_frames);
-
-    /* The cycle's monotonic timestamp, so the drain can place each trigger
-     * where it actually fell. RT safe - it reads a snapshot the graph
-     * already captured rather than asking the clock. */
-    struct pw_time pwt;
-    uint64_t cycle_ns = 0;
-    if (pw_stream_get_time_n(audio.stream, &pwt, sizeof(pwt)) == 0)
-        cycle_ns = (uint64_t)pwt.now;
-
-    audio_mix(dst, (size_t)n_frames, cycle_ns);
-
-    buf->datas[0].chunk->offset = 0;
-    buf->datas[0].chunk->stride = stride;
-    buf->datas[0].chunk->size   = (uint32_t)n_frames * (uint32_t)stride;
-
-    pw_stream_queue_buffer(audio.stream, b);
-}
-
-/* The stream died. This runs on PipeWire's thread loop, and it deliberately
- * does NOT rebuild anything: a stream cannot be destroyed from inside its own
- * callback. It raises a flag and pokes the epoll loop, which owns the rebuild.
- *
- * ERROR and UNCONNECTED are both handled because they are different failures.
- * A sink disappearing errors the node; the PipeWire DAEMON restarting takes
- * the core with it, which surfaces as UNCONNECTED - and no amount of
- * pw_stream_set_active revives a dead core, since pw_stream_new_simple owns
- * it. Both therefore route to the same destroy-and-rebuild. */
-static void on_state_changed(void *userdata, enum pw_stream_state old_state,
-                             enum pw_stream_state state, const char *error) {
-    (void)userdata; (void)old_state;
-
-    if (state != PW_STREAM_STATE_ERROR &&
-        state != PW_STREAM_STATE_UNCONNECTED)
-        return;
-
-    /* Our own teardown. pw_stream_destroy emits a final state_changed
-     * whenever the stream was not already unconnected, so both audio_cleanup
-     * and the rebuild's own close land here - and neither is news. Measured:
-     * a clean SIGTERM shutdown reports "paused -> unconnected". */
-    if (atomic_load(&audio.closing))
-        return;
-
-    if (atomic_exchange(&audio.restart, 1))
-        return;   /* a rebuild is already pending */
-
-    /* LOG_WARN, not pw_log_warn: this runs on the thread loop, not the data
-     * thread, so an fprintf here breaks no RT rule - and pw_log_warn is off
-     * at the default log level, which made this path invisible exactly when
-     * it needed watching. */
-    LOG_WARN("Audio stream %s -> %s (%s); requesting rebuild",
-             pw_stream_state_as_string(old_state),
-             pw_stream_state_as_string(state), error ? error : "-");
-
-    if (audio.wakefd >= 0) {
-        uint64_t one = 1;
-        ssize_t  n = write(audio.wakefd, &one, sizeof(one));
-        (void)n;  /* an EAGAIN here means the counter is already raised */
-    }
-}
-
-static const struct pw_stream_events stream_events = {
-    PW_VERSION_STREAM_EVENTS,
-    .process       = on_process,
-    .state_changed = on_state_changed,
-};
-
-/* Bring up the thread loop, the node and the format. Split from audio_start
- * because the reconnect path runs it again on a live daemon. */
-static int audio_stream_open(void) {
-    pw_init(NULL, NULL);
-
-    audio.loop = pw_thread_loop_new("doubletap-audio", NULL);
-    if (!audio.loop) { pw_deinit(); return -1; }
-
-    pw_thread_loop_lock(audio.loop);
-    struct pw_loop *pl = pw_thread_loop_get_loop(audio.loop);
-
-    uint8_t podbuf[1024];
-    struct spa_pod_builder b = SPA_POD_BUILDER_INIT(podbuf, sizeof(podbuf));
-    const struct spa_pod *params[1];
-
-    char lat[32];
-    snprintf(lat, sizeof(lat), "%u/%d", audio.latency, MIX_RATE);
-
-    struct pw_properties *props = pw_properties_new(
-        PW_KEY_MEDIA_TYPE,     "Audio",
-        PW_KEY_MEDIA_CATEGORY, "Playback",
-        PW_KEY_MEDIA_ROLE,     "Game",
-        PW_KEY_NODE_LATENCY,   lat,
-        NULL);
-
-    audio.stream = pw_stream_new_simple(pl, "doubletap", props,
-                                        &stream_events, NULL);
-    if (!audio.stream) {
-        pw_thread_loop_unlock(audio.loop);
-        pw_thread_loop_destroy(audio.loop);
-        audio.loop = NULL;
-        pw_deinit();
-        return -1;
-    }
-
-    params[0] = spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat,
-        &SPA_AUDIO_INFO_RAW_INIT(
-            .format   = SPA_AUDIO_FORMAT_F32,
-            .channels = MIX_CHANNELS,
-            .rate     = MIX_RATE));
-
-    pw_stream_connect(audio.stream,
-                      PW_DIRECTION_OUTPUT,
-                      PW_ID_ANY,
-                      PW_STREAM_FLAG_AUTOCONNECT |
-                      PW_STREAM_FLAG_MAP_BUFFERS  |
-                      PW_STREAM_FLAG_RT_PROCESS,
-                      params, 1);
-
-    pw_thread_loop_unlock(audio.loop);
-
-    if (pw_thread_loop_start(audio.loop) < 0) {
-        pw_thread_loop_lock(audio.loop);
-        pw_stream_destroy(audio.stream);
-        audio.stream = NULL;
-        pw_thread_loop_unlock(audio.loop);
-        pw_thread_loop_destroy(audio.loop);
-        audio.loop = NULL;
-        pw_deinit();
-        return -1;
-    }
-
-    return 0;
-}
-
-/* Commit to playing: audio is available if at least one sample mapped AND
- * the stream came up. A sample that failed to load leaves its key silent
- * rather than taking the others down with it.
- *
- * mlockall belongs here rather than in main() because the reason for it is
- * local: the RT callback must not take a page fault. */
-static int audio_start(unsigned latency_frames) {
-    audio.latency = latency_frames ? latency_frames : AUDIO_LATENCY_DEFAULT;
-    audio.wakefd  = -1;   /* explicit: the struct is static, and 0 is stdin */
-
-    int loaded = 0;
-    for (int i = 0; i < AUDIO_NSAMPLES; i++)
-        if (audio.sample[i].samples) loaded++;
-
-    if (loaded > 0) {
-        /* Before the stream, so a state_changed racing the first connect
-         * still finds somewhere to put its flag. */
-        audio.wakefd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-        if (audio.wakefd < 0)
-            LOG_WARN("eventfd: %s - audio will not recover a lost stream",
-                     strerror(errno));
-
-        if (audio_stream_open() == 0) {
-            mlockall(MCL_CURRENT | MCL_FUTURE);
-            audio_available = 1;
-            return 0;
-        }
-        if (audio.wakefd >= 0) { close(audio.wakefd); audio.wakefd = -1; }
-    }
-
-    LOG_WARN("Audio disabled (sample load or PipeWire init failed)");
-    for (int i = 0; i < AUDIO_NSAMPLES; i++) {
-        free(audio.sample[i].samples);
-        audio.sample[i].samples = NULL;
-    }
-    audio_available = 0;
-    return -1;
-}
-
-/* sample: 0 == V1, 1 == V2. Pushes onto the trigger ring and returns; the
- * RT thread turns it into a voice. Every trigger gets its OWN voice, so a
- * click never cuts off the one before it - not the other key's, and not an
- * earlier press of the same key.
- *
- * PRODUCER SIDE, and there is exactly one producer: the epoll loop. */
-static void audio_trigger(int sample, uint64_t t_ns) {
-    if (!audio_available) return;
-    if (sample < 0 || sample >= AUDIO_NSAMPLES) return;
-    if (!audio.sample[sample].samples) return;  /* nothing mapped: silent */
-
-    unsigned h = atomic_load_explicit(&trig.head, memory_order_relaxed);
-    unsigned t = atomic_load_explicit(&trig.tail, memory_order_acquire);
-    if (h - t >= TRIG_RING) {
-        /* Drop it. Never block and never spin: this is called from the
-         * input path, and a stalled epoll loop costs a keypress. */
-        atomic_fetch_add_explicit(&trig.overruns, 1, memory_order_relaxed);
-        return;
-    }
-    trig.e[h & (TRIG_RING - 1)].sample = (uint8_t)sample;
-    trig.e[h & (TRIG_RING - 1)].t_ns   = t_ns;
-    atomic_store_explicit(&trig.head, h + 1, memory_order_release);
-}
-
-/* Tear the node down without touching the samples. The rebuild path needs
- * exactly this much: the loaded, conformed samples outlive a PipeWire restart
- * and re-decoding them would be minutes of work for nothing. */
-static void audio_stream_close(void) {
-    atomic_store(&audio.closing, 1);
-    if (audio.loop) {
-        pw_thread_loop_stop(audio.loop);
-        pw_thread_loop_lock(audio.loop);
-        if (audio.stream) {
-            pw_stream_destroy(audio.stream);
-            audio.stream = NULL;
-        }
-        pw_thread_loop_unlock(audio.loop);
-        pw_thread_loop_destroy(audio.loop);
-        audio.loop = NULL;
-    }
-    pw_deinit();
-    atomic_store(&audio.closing, 0);
-}
-
-/* The fd the epoll loop watches to learn the stream needs rebuilding, or -1
- * if audio is not running. */
-static int audio_wake_fd(void) {
-    return audio_available ? audio.wakefd : -1;
-}
-
-static void audio_cleanup(void);
-
-/* Rebuild after the stream or the PipeWire daemon went away. Called from the
- * epoll loop - NEVER from a stream callback, and never from audio_mix.
- *
- * Voices in flight are lost with the old node. That is correct: they are
- * clicks, and the alternative is carrying a voice pool across a graph whose
- * rate we are about to renegotiate. */
-static void audio_restart(void) {
-    if (!audio_available) return;
-    if (!atomic_load(&audio.restart)) return;
-
-    audio_stream_close();
-
-    /* Clear the flag AFTER the teardown, never before. pw_stream_destroy
-     * emits a final state_changed on its way out whenever the stream was not
-     * already UNCONNECTED - which is precisely the ERROR case - and that
-     * callback re-arms the flag and pokes the eventfd. Clearing first leaves
-     * that self-inflicted signal standing, so the next epoll wake tears down
-     * the stream just built, forever. */
-    atomic_store(&audio.restart, 0);
-    uint64_t drain;
-    while (audio.wakefd >= 0 && read(audio.wakefd, &drain, sizeof(drain)) > 0)
-        ;
-
-    memset(audio.voice, 0, sizeof(audio.voice));
-
-    /* Drop the backlog. audio_trigger kept filling the ring while the stream
-     * was dead - up to all 64 entries - and every one of them is now old
-     * enough to clamp to frame 0. Draining them into the new stream would
-     * fire dozens of seconds-stale clicks at once, which is a good deal worse
-     * than losing them. Safe to touch tail here: the thread loop is stopped
-     * and destroyed, so the consumer does not exist. */
-    atomic_store(&trig.tail, atomic_load(&trig.head));
-
-    if (audio_stream_open() != 0) {
-        /* Terminal. Tear down through the normal path rather than just
-         * clearing the flag: audio_cleanup gates on audio_available, so
-         * dropping it here would make the shutdown teardown a no-op and
-         * strand the samples and the eventfd. */
-        LOG_WARN("Audio stream lost and could not be rebuilt; going silent");
-        audio_cleanup();
-        return;
-    }
-    LOG_INFO("Audio stream rebuilt");
-}
-
-static void audio_cleanup(void) {
-    if (!audio_available) return;
-    audio_stream_close();
-    if (audio.wakefd >= 0) { close(audio.wakefd); audio.wakefd = -1; }
-    unsigned dropped = atomic_load(&trig.overruns);
-    if (dropped)
-        LOG_WARN("%u hitsound trigger(s) dropped on a full ring", dropped);
-    for (int i = 0; i < AUDIO_NSAMPLES; i++) {
-        free(audio.sample[i].samples);
-        audio.sample[i].samples = NULL;
-    }
-    audio_available = 0;
-}
 /* ------------------------------------------------------------------------- */
 /* Config                                                                    */
 /* ------------------------------------------------------------------------- */
@@ -848,14 +171,6 @@ typedef struct {
     int      auto_discover; /* no 'devices' list: scan for matching keyboards */
     int      k1, k2, v1, v2;
     int      socd;
-    int      audio_enabled;
-    char    *wav_path;      /* base sample; per-key fallback */
-    char    *wav_v1;        /* optional V1 override (NULL -> use wav_path) */
-    char    *wav_v2;        /* optional V2 override (NULL -> use wav_path) */
-    float    gain;          /* base gain; per-key fallback (default 1.0) */
-    float    gain_v1;       /* V1 gain override (<0 -> use gain) */
-    float    gain_v2;       /* V2 gain override (<0 -> use gain) */
-    unsigned audio_latency; /* requested node quantum, frames (0 -> default) */
     char    *uinput_name;
     analog_config_t analog;
 } oid_config_t;
@@ -866,11 +181,6 @@ static void config_init(oid_config_t *c) {
     c->k2 = DEF_K2;
     c->v1 = DEF_V1;
     c->v2 = DEF_V2;
-    c->audio_enabled = 1;
-    c->gain    = 1.0f;
-    c->audio_latency = AUDIO_LATENCY_DEFAULT;
-    c->gain_v1 = -1.0f; /* sentinel: unset -> falls back to gain */
-    c->gain_v2 = -1.0f;
     c->analog.travel_mm     = 4.0f;
     c->analog.actuation_mm  = 1.0f;
     c->analog.rt_enabled    = 1;
@@ -886,9 +196,6 @@ static void config_free(oid_config_t *c) {
     for (size_t i = 0; i < c->n_devices; i++)
         free(c->device_paths[i]);
     free(c->device_paths);
-    free(c->wav_path);
-    free(c->wav_v1);
-    free(c->wav_v2);
     free(c->uinput_name);
     free(c->analog.device);
     memset(c, 0, sizeof(*c));
@@ -932,8 +239,8 @@ static int parse_bool(yaml_node_t *n, int *out) {
     return -1;
 }
 
-/* Parse a non-negative float (a linear gain). Rejects garbage and negatives. */
-static int parse_gain(yaml_node_t *n, float *out) {
+/* Parse a non-negative float. Rejects garbage and negatives. */
+static int parse_nonneg(yaml_node_t *n, float *out) {
     if (!n || n->type != YAML_SCALAR_NODE) return -1;
     const char *s = (const char *)n->data.scalar.value;
     char *end = NULL;
@@ -944,23 +251,6 @@ static int parse_gain(yaml_node_t *n, float *out) {
     *out = (float)d;
     return 0;
 }
-
-/* Parse a frame count, bounded. The range is not decoration: PipeWire's own
- * quantum-floor/limit sit at 4 and 8192, and a node.latency outside what the
- * graph will run is silently ignored rather than clamped - which reads as
- * "my config did nothing". */
-static int parse_frames(yaml_node_t *n, long *out) {
-    if (!n || n->type != YAML_SCALAR_NODE) return -1;
-    const char *s = (const char *)n->data.scalar.value;
-    char *end = NULL;
-    errno = 0;
-    long v = strtol(s, &end, 0);
-    if (end == s || *end != '\0' || errno != 0)
-        return -1;
-    *out = v;
-    return 0;
-}
-
 
 /* Fill in the deep profile from the tapping profile wherever the config
  * left it unset, so everything downstream reads concrete numbers. */
@@ -1228,7 +518,8 @@ static int load_config(const char *path, oid_config_t *c) {
         };
         for (size_t i = 0; i < sizeof(mm) / sizeof(mm[0]); i++) {
             yaml_node_t *v = map_get(&doc, an, mm[i].key);
-            if (v && parse_gain(v, (float *)((char *)&c->analog + mm[i].off))) {
+            if (v && parse_nonneg(v, (float *)((char *)&c->analog +
+                                              mm[i].off))) {
                 LOG_ERR("'analog.%s' must be a non-negative number", mm[i].key);
                 goto out;
             }
@@ -1258,19 +549,19 @@ static int load_config(const char *path, oid_config_t *c) {
                 goto out;
             }
             yaml_node_t *pm = map_get(&doc, rt, "press_mm");
-            if (pm && parse_gain(pm, &c->analog.rt_press_mm) != 0) {
+            if (pm && parse_nonneg(pm, &c->analog.rt_press_mm) != 0) {
                 LOG_ERR("'analog.rapid_trigger.press_mm' must be a "
                         "non-negative number");
                 goto out;
             }
             yaml_node_t *bo = map_get(&doc, rt, "bottom_out_mm");
-            if (bo && parse_gain(bo, &c->analog.bottom_out_mm) != 0) {
+            if (bo && parse_nonneg(bo, &c->analog.bottom_out_mm) != 0) {
                 LOG_ERR("'analog.rapid_trigger.bottom_out_mm' must be a "
                         "non-negative number");
                 goto out;
             }
             yaml_node_t *rm = map_get(&doc, rt, "release_mm");
-            if (rm && parse_gain(rm, &c->analog.rt_release_mm) != 0) {
+            if (rm && parse_nonneg(rm, &c->analog.rt_release_mm) != 0) {
                 LOG_ERR("'analog.rapid_trigger.release_mm' must be a "
                         "non-negative number");
                 goto out;
@@ -1302,66 +593,6 @@ static int load_config(const char *path, oid_config_t *c) {
             }
             *(int *)((char *)&c->analog + hid[i].off) = (int)u;
         }
-    }
-
-    /* audio: optional mapping */
-    yaml_node_t *aud = map_get(&doc, root, "audio");
-    if (aud) {
-        if (aud->type != YAML_MAPPING_NODE) {
-            LOG_ERR("'audio' must be a mapping");
-            goto out;
-        }
-        yaml_node_t *en = map_get(&doc, aud, "enabled");
-        if (en && parse_bool(en, &c->audio_enabled) != 0) {
-            LOG_ERR("'audio.enabled' must be a boolean");
-            goto out;
-        }
-        yaml_node_t *wav = map_get(&doc, aud, "wav");
-        if (wav && scalar_dup(wav, &c->wav_path) != 0) {
-            LOG_ERR("'audio.wav' must be a scalar string");
-            goto out;
-        }
-        yaml_node_t *wav1 = map_get(&doc, aud, "wav_v1");
-        if (wav1 && scalar_dup(wav1, &c->wav_v1) != 0) {
-            LOG_ERR("'audio.wav_v1' must be a scalar string");
-            goto out;
-        }
-        yaml_node_t *wav2 = map_get(&doc, aud, "wav_v2");
-        if (wav2 && scalar_dup(wav2, &c->wav_v2) != 0) {
-            LOG_ERR("'audio.wav_v2' must be a scalar string");
-            goto out;
-        }
-        yaml_node_t *g = map_get(&doc, aud, "gain");
-        if (g && parse_gain(g, &c->gain) != 0) {
-            LOG_ERR("'audio.gain' must be a non-negative number");
-            goto out;
-        }
-        yaml_node_t *g1 = map_get(&doc, aud, "gain_v1");
-        if (g1 && parse_gain(g1, &c->gain_v1) != 0) {
-            LOG_ERR("'audio.gain_v1' must be a non-negative number");
-            goto out;
-        }
-        yaml_node_t *g2 = map_get(&doc, aud, "gain_v2");
-        if (g2 && parse_gain(g2, &c->gain_v2) != 0) {
-            LOG_ERR("'audio.gain_v2' must be a non-negative number");
-            goto out;
-        }
-
-        yaml_node_t *lat = map_get(&doc, aud, "latency");
-        if (lat) {
-            long v = 0;
-            if (parse_frames(lat, &v) != 0 || v < 16 || v > 8192) {
-                LOG_ERR("'audio.latency' must be a frame count in 16..8192");
-                goto out;
-            }
-            c->audio_latency = (unsigned)v;
-        }
-    }
-    /* Base sample defaults only when no per-key override covers a voice.
-     * A voice with no wav (base or override) simply stays silent. */
-    if (c->audio_enabled && !c->wav_path && (!c->wav_v1 || !c->wav_v2)) {
-        c->wav_path = strdup(DEF_WAV);
-        if (!c->wav_path) { LOG_ERR("oom"); goto out; }
     }
 
     /* uinput: optional mapping */
@@ -1403,11 +634,7 @@ out:
 /* epoll user-data tag. The inotify fd is still identified by a NULL ptr;
  * everything else leads with one of these so run_loop can tell an evdev
  * device from the analog hidraw node. */
-enum { EP_INPUT = 1, EP_ANALOG = 2, EP_AUDIO = 3 };
-
-/* The audio wake eventfd has no struct of its own; the epoll set is keyed
- * on a leading discriminator, so it gets a standing one. */
-static int g_ep_audio = EP_AUDIO;
+enum { EP_INPUT = 1, EP_ANALOG = 2 };
 
 /* SOCD state for one input source. Per-source, not global: several
  * keyboards are tracked independently even though they share one virtual
@@ -1544,21 +771,6 @@ static input_dev_t *input_try_open(const char *path, const oid_config_t *cfg,
         close(fd);
         return NULL;
     }
-
-    /* Put event timestamps on the same clock the audio graph runs on.
-     * evdev stamps CLOCK_REALTIME by default and PipeWire is monotonic, so
-     * without this the sub-buffer placement in mix_drain_triggers would be
-     * comparing two unrelated epochs.
-     *
-     * Through libevdev rather than a raw EVIOCSCLOCKID ioctl: libevdev keeps
-     * its own clock_id to stamp the events it synthesises during SYN_DROPPED
-     * resync, and an ioctl issued behind its back switches the kernel while
-     * leaving those on REALTIME. Not fatal if it fails - the timestamps just
-     * fall out of range and every trigger clamps to frame 0, which is where
-     * they all landed before any of this. */
-    if (libevdev_set_clock_id(dev, CLOCK_MONOTONIC) != 0 && !quiet)
-        LOG_WARN("%s: cannot use CLOCK_MONOTONIC; hitsound placement will "
-                 "fall back to the start of the buffer", path);
 
     /* Grabbing while a key is physically down would swallow its release:
      * the press already reached the display server through the raw device,
@@ -2172,8 +1384,8 @@ static void analog_dev_close(analog_dev_t *ad) {
 
 /* -A: dump live travel depth so thresholds can be picked against the real
  * board, and so a key's usage id can be discovered when the keymap walk
- * comes up empty. Deliberately touches nothing else - no grab, no uinput,
- * no audio - so it is safe to run alongside a live daemon. */
+ * comes up empty. Deliberately touches nothing else - no grab, no uinput -
+ * so it is safe to run alongside a live daemon. */
 /* -T: dump the travel of k1/k2 to stdout, one line per hardware report,
  * so a play session can be replayed through the state machine offline.
  *
@@ -2188,9 +1400,9 @@ static void analog_dev_close(analog_dev_t *ad) {
  * the absent one really is at rest. Timestamps are monotonic microseconds
  * since `t0_monotonic_ns` in the header, which is taken just before it is
  * written. The header carries that origin in BOTH clocks so a trace can be
- * lined up with anything else on the machine: monotonic against PipeWire's
- * graph clock and our own evdev stamps, realtime against logs that print
- * wall time. The two reads are back to back, so the pair agrees to a few
+ * lined up with anything else on the machine: monotonic against whatever
+ * else is stamped on that clock, realtime against logs that print wall
+ * time. The two reads are back to back, so the pair agrees to a few
  * microseconds. Readers that predate the anchors skip them as comments.
  *
  * The header also records every threshold the analog front-end reads, so
@@ -2458,9 +1670,6 @@ static void destroy_virtual(void) {
 /* ------------------------------------------------------------------------- */
 
 /*
- * Returns 1 if a virtual key-down was emitted (so the caller can trigger
- * audio), 0 otherwise.
- *
  *   state = k1 + k2 + ie.value   (k1, k2 post-update)
  *
  *     0 = NONE     last key released
@@ -2481,14 +1690,12 @@ enum { S_NONE = 0, S_RELEASE = 1, S_SINGLE = 2, S_PRESS = 3 };
  * process_event() below feeds it real key events, analog_drive() feeds it
  * edges derived from travel depth. The transition logic is identical either
  * way, which is the point. */
-static int socd_apply(socd_state_t *in, int is_k1, int value, int mode,
-                      const oid_config_t *cfg) {
+static void socd_apply(socd_state_t *in, int is_k1, int value, int mode,
+                       const oid_config_t *cfg) {
     in->mode = mode;
 
     if (mode == SOCD_OFF) {
-        /* k1/k2 still tracked so release_stuck can clean up a dying device.
-         * Each key maps 1:1 to its own voice; both may sound if both are
-         * pressed (they play on independent streams). */
+        /* k1/k2 still tracked so release_stuck can clean up a dying device. */
         if (value != 2) {
             if (is_k1) in->k1 = value;
             else       in->k2 = value;
@@ -2496,19 +1703,16 @@ static int socd_apply(socd_state_t *in, int is_k1, int value, int mode,
         libevdev_uinput_write_event(uidev, EV_KEY,
                                     is_k1 ? cfg->v1 : cfg->v2, value);
         libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
-        if (value != 1)
-            return VOICE_NONE;
-        return is_k1 ? VOICE_V1 : VOICE_V2;
+        return;
     }
 
     if (value == 2) /* autorepeat messes up state*/
-        return VOICE_NONE;
+        return;
 
     if (is_k1) in->k1 = value;
     else       in->k2 = value;
 
     int state = in->k1 + in->k2 + value;
-    int triggered = VOICE_NONE;
 
     switch (state) {
         case S_SINGLE: {
@@ -2516,7 +1720,6 @@ static int socd_apply(socd_state_t *in, int is_k1, int value, int mode,
         in->act = is_k1;
         libevdev_uinput_write_event(uidev, EV_KEY, code, 1);
         libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
-        triggered = is_k1 ? VOICE_V1 : VOICE_V2;
         break;
         }
         case S_RELEASE:
@@ -2533,8 +1736,6 @@ static int socd_apply(socd_state_t *in, int is_k1, int value, int mode,
         libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
         libevdev_uinput_write_event(uidev, EV_KEY, down_code, 1);
         libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
-        /* down_code is the newly-pressed key: v2 when act was 1, else v1 */
-        triggered = in->act ? VOICE_V2 : VOICE_V1;
         in->act = !in->act;
         break;
         }
@@ -2549,30 +1750,28 @@ static int socd_apply(socd_state_t *in, int is_k1, int value, int mode,
         /* shouldn't make it here w/ sane inputs. */
         break;
     }
-
-    return triggered;
 }
 
 /* evdev entry point: mirror everything that isn't k1/k2, and hand k1/k2 to
  * the SOCD core. In analog mode this device's k1/k2 are driven from travel
  * depth instead, so the digital copies are dropped here to avoid emitting
  * each press twice. */
-static int process_event(input_dev_t *in, const struct input_event *ie,
-                         const oid_config_t *cfg) {
+static void process_event(input_dev_t *in, const struct input_event *ie,
+                          const oid_config_t *cfg) {
     if (ie->type == EV_MSC && ie->code == MSC_SCAN)
-        return VOICE_NONE;
+        return;
 
     if (ie->type != EV_KEY ||
         (ie->code != (unsigned)cfg->k1 && ie->code != (unsigned)cfg->k2)) {
         libevdev_uinput_write_event(uidev, ie->type, ie->code, ie->value);
-        return VOICE_NONE;
+        return;
     }
 
     if (in->analog)
-        return VOICE_NONE;
+        return;
 
-    return socd_apply(&in->socd, ie->code == (unsigned)cfg->k1, ie->value,
-                      cfg->socd, cfg);
+    socd_apply(&in->socd, ie->code == (unsigned)cfg->k1, ie->value,
+               cfg->socd, cfg);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -2601,16 +1800,8 @@ static int drain_device(input_dev_t *in, const oid_config_t *cfg) {
         /* Grab still deferred: the system receives these events directly
          * through the ungrabbed device, so mirroring or filtering them
          * would double them up - just let libevdev track the key state. */
-        if (in->grabbed) {
-            int voice = process_event(in, &ie, cfg);
-            if (voice != VOICE_NONE)
-                /* VOICE_V1/V2 -> sample index 0/1, stamped with the key's
-                 * own event time rather than now: that is the whole point,
-                 * and the two differ by however long this drain has run. */
-                audio_trigger(voice - 1,
-                              (uint64_t)ie.time.tv_sec * 1000000000ull +
-                              (uint64_t)ie.time.tv_usec * 1000ull);
-        }
+        if (in->grabbed)
+            process_event(in, &ie, cfg);
     }
 
     if (!in->grabbed && !any_key_down(in->dev)) {
@@ -2710,17 +1901,14 @@ static void analog_deep_set(analog_dev_t *ad, int on,
      * what the new disarm rule buys:
      *
      * ARMING goes from OFF's two keys down to the toggle's one. Planting is
-     * not a note, and both keys already sounded under OFF when they bottomed.
+     * not a note, and both keys already pressed under OFF on their way down.
      *
      * DISARMING goes from the toggle's one to none. The old rule could fire
      * with the other finger still planted deep, so it had to PRESS to avoid
      * stranding that hold - at the cost of a second note for one lift. Under
      * "both off the floor" there is by definition nobody still riding, so
      * there is no survivor to strand and nothing to press. The parked front
-     * ends above pick the keys back up on their next real stroke.
-     *
-     * The audio_trigger call that used to sit here went with it: nothing
-     * here presses, so nothing here clicks. */
+     * ends above pick the keys back up on their next real stroke. */
     for (int k = 0; k < 2; k++) {
         if (from[k] == to[k]) continue;
         libevdev_uinput_write_event(uidev, EV_KEY,
@@ -2804,7 +1992,7 @@ static void analog_deep_update(analog_dev_t *ad, const oid_config_t *cfg,
         (double)(t_ns - ad->plant_ns) >= (double)a->latch_debounce_ms * 1e6) {
         ad->plant_pending = 0;
         /* Logged because arming is otherwise INVISIBLE: it is release-only
-         * by construction, it never clicks, and the first dip out of it
+         * by construction, it never presses, and the first dip out of it
          * reverts through two writes the kernel drops. With no trace of it
          * anywhere, a latch that never arms and a latch that arms and works
          * look identical from outside - which is exactly the question you
@@ -2821,8 +2009,8 @@ static void analog_deep_update(analog_dev_t *ad, const oid_config_t *cfg,
 /* Route one synthesized edge into the SOCD core under whatever mode the
  * `deep` latch selects. The latch itself is resolved once per sample in
  * analog_drain, before any of that sample's edges are applied. */
-static int analog_socd_edge(analog_dev_t *ad, int is_k1, int value,
-                            const oid_config_t *cfg) {
+static void analog_socd_edge(analog_dev_t *ad, int is_k1, int value,
+                             const oid_config_t *cfg) {
     /* cfg->socd is SOCD_ANALOG here; socd_apply special-cases only OFF and
      * SNAPPY, so ANALOG runs the toggle path. Deliberate, not accidental. */
     int mode = ad->deep ? cfg->socd : SOCD_OFF;
@@ -2843,45 +2031,11 @@ static int analog_socd_edge(analog_dev_t *ad, int is_k1, int value,
      * down(!act) always a real press, whichever finger moves. So the choice
      * at arming is genuinely arbitrary, `act_bound` is gone, and so is the
      * cycle that used to repair the no-op. */
-    int held[2] = { ad->socd.k1, ad->socd.k2 };
-    int before[2];
-    socd_virtual_state(held, ad->socd.act, mode, before);
-
     if (value == 1)
         ad->last_press = is_k1 ? 0 : 1;
 
-    int voice = socd_apply(&ad->socd, is_k1, value, mode, cfg);
-
-    int after[2];
-    held[0] = ad->socd.k1;
-    held[1] = ad->socd.k2;
-    socd_virtual_state(held, ad->socd.act, mode, after);
-
-    /* Claim a click only when the virtual picture actually moved. Under the
-     * backplate rule every toggle transition does, so this no longer has a
-     * repair to make - it stays as the guard that keeps the click and the
-     * emitted output in step, and regimetest asserts it never fires while
-     * riding. */
-    if (voice != VOICE_NONE &&
-        !(before[voice - 1] == 0 && after[voice - 1] == 1))
-        voice = VOICE_NONE;
-
-    return voice;
+    socd_apply(&ad->socd, is_k1, value, mode, cfg);
 }
-
-/* Which voice a report claimed. Indirected through a macro purely so
- * tools/regimetest.c can observe it: defining it over audio_trigger itself
- * would rewrite that function's own definition, which the tools compile too.
- * Nothing else should redefine this.
- *
- * It stays a ONE-ARGUMENT macro and picks `t_ns` up from the enclosing
- * function instead of taking it. Widening it would break regimetest's
- * `#define ANALOG_CLICK(voice) note_voice(voice)` for no gain: the timestamp
- * is a property of the report, not of the voice, and there is exactly one
- * report in scope wherever this expands. */
-#ifndef ANALOG_CLICK
-#define ANALOG_CLICK(voice) audio_trigger((voice) - 1, t_ns)
-#endif
 
 /* Turn ONE report's worth of depths into SOCD edges. Split out of
  * analog_drain so that tools/replay.c and tools/regimetest.c drive this
@@ -2907,11 +2061,8 @@ static void analog_report(analog_dev_t *ad, const oid_config_t *cfg,
     analog_deep_update(ad, cfg, depth, t_ns);
 
     for (int k = 0; k < 2; k++)
-        for (int e = 0; e < ne[k]; e++) {
-            int voice = analog_socd_edge(ad, k == 0, edges[k][e], cfg);
-            if (voice != VOICE_NONE)
-                ANALOG_CLICK(voice);
-        }
+        for (int e = 0; e < ne[k]; e++)
+            analog_socd_edge(ad, k == 0, edges[k][e], cfg);
 }
 
 /* Read every queued analog report and turn travel depth into SOCD edges.
@@ -2932,10 +2083,9 @@ static int analog_drain(analog_dev_t *ad, const oid_config_t *cfg) {
         if (n == 0)
             return -1;
 
-        /* hidraw carries no timestamp, so the report is stamped on arrival.
-         * The same clock the evdev path is on (see libevdev_set_clock_id in
-         * input_try_open) - one vDSO read on a path that already syscalls
-         * per report. */
+        /* hidraw carries no timestamp, so the report is stamped on arrival
+         * - the latch debounce in analog_deep_update is judged on these.
+         * One vDSO read on a path that already syscalls per report. */
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
         uint64_t t_ns = (uint64_t)now.tv_sec * 1000000000ull +
@@ -3065,17 +2215,6 @@ static int run_loop(dev_list_t *devs, const oid_config_t *cfg,
         }
     }
 
-    /* Audio asking to be rebuilt. Losing this watch is not fatal - it costs
-     * recovery from a PipeWire restart, not the daemon. */
-    int afd = audio_wake_fd();
-    if (afd >= 0) {
-        struct epoll_event ev = { .events = EPOLLIN,
-                                  .data = { .ptr = &g_ep_audio } };
-        if (epoll_ctl(epfd, EPOLL_CTL_ADD, afd, &ev) < 0)
-            LOG_WARN("epoll_ctl ADD audio: %s - a lost stream will stay lost",
-                     strerror(errno));
-    }
-
     reconcile_devices(devs, cfg, input_dir, epfd, 1);
     if (devs->n == 0) {
         if (ifd < 0) {
@@ -3104,11 +2243,6 @@ static int run_loop(dev_list_t *devs, const oid_config_t *cfg,
                 while (read(ifd, buf, sizeof(buf)) > 0)
                     ;
                 rescan = 1;
-                continue;
-            }
-
-            if (*(int *)events[i].data.ptr == EP_AUDIO) {
-                audio_restart();
                 continue;
             }
 
@@ -3176,7 +2310,7 @@ static void print_usage(FILE *s, const char *prog) {
         "Grabs evdev keyboard devices, applies a SOCD radio-button filter (reverting\n"
         "toggle, snappy last-input-wins, analog, or off, per the config's 'socd'\n"
         "field) to two configurable keys, and re-emits everything via a\n"
-        "single uinput virtual keyboard. Plays a click on each virtual keypress.\n"
+        "single uinput virtual keyboard.\n"
         "\n"
         "'analog' needs an analog keyboard: it runs 'off' while you alt-tap and\n"
         "switches to the toggle while you rock, deciding between them on how far\n"
@@ -3285,14 +2419,13 @@ main(int argc, char **argv) {
     else
         snprintf(devdesc, sizeof(devdesc), "%zu device(s)", cfg.n_devices);
     LOG_INFO("Config: %s, keys k1=%s(%d) k2=%s(%d) "
-             "v1=%s(%d) v2=%s(%d), socd=%s, audio=%s",
+             "v1=%s(%d) v2=%s(%d), socd=%s",
              devdesc,
              k1n ? k1n : "?", cfg.k1, k2n ? k2n : "?", cfg.k2,
              v1n ? v1n : "?", cfg.v1, v2n ? v2n : "?", cfg.v2,
              cfg.socd == SOCD_SNAPPY ? "snappy"
                  : cfg.socd == SOCD_OFF    ? "off"
-                 : cfg.socd == SOCD_ANALOG ? "analog" : "toggle",
-             cfg.audio_enabled ? "enabled" : "disabled");
+                 : cfg.socd == SOCD_ANALOG ? "analog" : "toggle");
 
 	/* use rt scheduler if we can */
     struct sched_param sp = { .sched_priority = 90 };
@@ -3302,34 +2435,9 @@ main(int argc, char **argv) {
         LOG_INFO("Successfully acquired SCHED_FIFO real-time priority.");
     }
 
-    /* Best-effort audio. All main() still owns is what doubletap's two
-     * virtual keys mean: which path and gain each takes, with a per-key
-     * override falling back to the base wav/gain. Decoding, conforming and
-     * bringing up the node are the subsystem's own business. */
-    if (cfg.audio_enabled) {
-        const char *wav_paths[AUDIO_NSAMPLES] = {
-            cfg.wav_v1 ? cfg.wav_v1 : cfg.wav_path,
-            cfg.wav_v2 ? cfg.wav_v2 : cfg.wav_path,
-        };
-        float gains[AUDIO_NSAMPLES] = {
-            cfg.gain_v1 >= 0.0f ? cfg.gain_v1 : cfg.gain,
-            cfg.gain_v2 >= 0.0f ? cfg.gain_v2 : cfg.gain,
-        };
-
-        for (int i = 0; i < AUDIO_NSAMPLES; i++) {
-            if (!wav_paths[i]) continue; /* intentionally silent */
-            if (audio_load(i, wav_paths[i], gains[i]) != 0)
-                LOG_WARN("V%d hitsound load failed (%s); that key stays silent",
-                         i + 1, wav_paths[i]);
-        }
-
-        audio_start(cfg.audio_latency);
-    }
-
     /* Single virtual keyboard. Created before any grabs: device discovery
      * runs inside run_loop and skips it via is_doubletap_output. */
     if (build_virtual(&cfg) != 0) {
-        audio_cleanup();
         config_free(&cfg);
         return EXIT_FAILURE;
     }
@@ -3365,7 +2473,6 @@ main(int argc, char **argv) {
         free(devs.v[i]);
     }
     free(devs.v);
-    audio_cleanup();
     config_free(&cfg);
     return rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
