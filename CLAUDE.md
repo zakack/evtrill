@@ -106,7 +106,10 @@ the tools also compile).
 `deep` latch and its mode transitions, run with `./build/regimetest`; case K
 drives `analog_drain` itself from encoded HID reports over a pipe, since
 every other case (and `replay`) calls the front-end directly and would not
-catch a fault in the read/decode path. `tests/*.csv` are recorded `-T`
+catch a fault in the read/decode path. Cases M and Q call `socd_apply`
+directly, the way `process_event` does: M is the digital toggle and the only
+`snappy` coverage, Q is autorepeat (forwarded in `off`, dropped by the
+state-machine modes). `tests/*.csv` are recorded `-T`
 sessions named `<style>_<name>_Nphys_Mvirt.csv`, where N is the physical
 presses played and M the virtual presses the daemon must emit — `replay`
 prints M, so the filename is the expected result. The `tap_*` traces must

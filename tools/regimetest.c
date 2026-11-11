@@ -44,9 +44,16 @@ static int vstate[2];
  * every transition as it is written. */
 static unsigned vpresses;
 
+static unsigned vrepeats;
+
 static void test_emit(unsigned type, unsigned code, int value) {
     if (type != EV_KEY) return;                    /* ignore SYN */
     int k = (code == V1) ? 0 : 1;
+    /* Autorepeat is not a transition: the kernel forwards value 2 to
+     * userspace and leaves the key down. Counting it separately keeps it out
+     * of the press/release log while still letting a test assert it was
+     * forwarded at all, which is the whole point in `off` mode. */
+    if (value == 2) { vrepeats++; return; }
     if (vstate[k] == value) return;                /* no-change: dropped */
     vstate[k] = value;
     if (value) vpresses++;
@@ -157,6 +164,41 @@ static void fresh(void) {
     vstate[0] = vstate[1] = 0;
     vpresses  = 0;
     reset_log();
+}
+
+/* ---------------------------------------------------------------------- *
+ * The SOCD core on its own (cases M and Q).
+ *
+ * Everything above reaches socd_apply through the analog front-end, which
+ * only ever runs it as OFF or as the toggle and never sends autorepeat.
+ * These call it directly, the way process_event does for the digital path.
+ * ---------------------------------------------------------------------- */
+static oid_config_t dcfg;
+static socd_state_t ds;
+
+static void dfresh(int socd) {
+    memset(&dcfg, 0, sizeof dcfg);
+    memset(&ds, 0, sizeof ds);
+    dcfg.socd = socd;
+    dcfg.v1   = V1;
+    dcfg.v2   = V2;
+    vstate[0] = vstate[1] = 0;
+    vpresses  = 0;
+    vrepeats  = 0;
+    reset_log();
+}
+
+/* One physical key edge: k == 0 is k1, k == 1 is k2. */
+static void dkey(int k, int value) {
+    reset_log();
+    note_voice(socd_apply(&ds, k == 0, value, dcfg.socd, &dcfg));
+}
+
+/* Press-then-release, for the common "tap a key on its own" shape. */
+static void dtap(int k) {
+    reset_log();
+    note_voice(socd_apply(&ds, k == 0, 1, dcfg.socd, &dcfg));
+    socd_apply(&ds, k == 0, 0, dcfg.socd, &dcfg);
 }
 
 
@@ -475,6 +517,64 @@ int main(void) {
     sample(3.85f, 3.85f);
     expect_log("arms: again the older one steps aside", "v2-");
     expect_int("  and again the newer keeps it", vstate[0], 1);
+
+    puts("M. the digital core: toggle and snappy on k1/k2");
+    dfresh(SOCD_TOGGLE);
+    dtap(0);
+    expect_log("k1 tapped alone", "v1+ v1-");
+    dtap(0);
+    expect_log("k1 again - same virtual", "v1+ v1-");
+    dtap(1);
+    expect_log("k2 tapped alone", "v2+ v2-");
+
+    dfresh(SOCD_TOGGLE);
+    dtap(1);
+    expect_log("k2 pressed FIRST emits v2", "v2+ v2-");
+
+    dfresh(SOCD_TOGGLE);
+    dkey(0, 1); expect_log("k1 down", "v1+");
+    dkey(1, 1); expect_log("k2 down: the toggle steals", "v1- v2+");
+    dkey(0, 0); expect_log("k1 up: reverting toggle", "v2- v1+");
+    dkey(1, 0); expect_log("k2 up: last key released", "v1-");
+
+    /* snappy has no coverage anywhere else, so pin the one branch that
+     * distinguishes it: S_RELEASE reverts only for the ACTIVE key. */
+    dfresh(SOCD_SNAPPY);
+    dkey(0, 1); expect_log("snappy: k1 down", "v1+");
+    dkey(1, 1); expect_log("  k2 down steals", "v1- v2+");
+    dkey(0, 0); expect_log("  releasing the SUPPRESSED key does nothing", "");
+    dkey(1, 0); expect_log("  releasing the active key releases", "v2-");
+
+    dfresh(SOCD_SNAPPY);
+    dkey(0, 1); expect_log("snappy: k1 down", "v1+");
+    dkey(1, 1); expect_log("  k2 down steals", "v1- v2+");
+    dkey(1, 0); expect_log("  releasing the ACTIVE key reverts", "v2- v1+");
+    dkey(0, 0); expect_log("  last key released", "v1-");
+
+    puts("Q. autorepeat: forwarded in off mode, dropped by the toggle");
+    /* off mode forwards autorepeat to v1/v2 verbatim and always has. The
+     * state-machine modes drop it inside socd_apply. */
+    dfresh(SOCD_OFF);
+    dkey(0, 1); expect_log("k1 down", "v1+");
+    dkey(0, 2);
+    expect_log("k1 autorepeat: not a press", "");
+    expect_int("  but it IS forwarded in off mode", (int)vrepeats, 1);
+    expect_int("  and k1 is still tracked as held", ds.k1, 1);
+    dkey(0, 0); expect_log("k1 up", "v1-");
+
+    dfresh(SOCD_TOGGLE);
+    dkey(0, 1); expect_log("k1 down", "v1+");
+    dkey(0, 2); expect_log("autorepeat is dropped by the toggle", "");
+    expect_int("  not forwarded either", (int)vrepeats, 0);
+    expect_int("  and k1 is still tracked as held", ds.k1, 1);
+    dkey(0, 0); expect_log("k1 up", "v1-");
+
+    /* off is a plain 1:1 remap: both virtuals down together. */
+    dfresh(SOCD_OFF);
+    dkey(0, 1); expect_log("off: k1 down", "v1+");
+    dkey(1, 1); expect_log("  k2 down - no stealing", "v2+");
+    dkey(0, 0); expect_log("  k1 up", "v1-");
+    dkey(1, 0); expect_log("  k2 up", "v2-");
 
     puts("S. latch_debounce_ms: both must STAY planted before it arms");
     /* Two hard taps that both graze the floor in one report are an
