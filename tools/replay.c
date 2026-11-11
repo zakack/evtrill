@@ -237,7 +237,7 @@ static void replay_emit(unsigned type, unsigned code, int value) {
 static void replay_run(const trace_t *tr, const oid_config_t *cfg,
                        run_t *out) {
     analog_dev_t ad;
-    analog_dev_stub(&ad);
+    memset(&ad, 0, sizeof(ad));
     memset(&g_run, 0, sizeof(g_run));
     memset(g_vkey, 0, sizeof(g_vkey));   /* the sweep re-runs this pass */
     g_run.first_engage_us = -1;
@@ -253,7 +253,7 @@ static void replay_run(const trace_t *tr, const oid_config_t *cfg,
         /* The daemon's own per-report path, not a restatement of it - the
          * ordering inside analog_report is load-bearing and a copy here
          * would be free to drift while still passing replay's own checks. */
-        float depth[POOL_MAX] = { tr->f[i].mm[0], tr->f[i].mm[1] };
+        float depth[2] = { tr->f[i].mm[0], tr->f[i].mm[1] };
         /* The trace's own timestamp, so the placement path sees real
          * inter-report spacing rather than a synthetic constant. */
         analog_report(&ad, cfg, depth, (uint64_t)tr->f[i].us * 1000ull);
@@ -531,8 +531,8 @@ int main(int argc, char **argv) {
                         "thresholds; ignoring them and reading the config\n");
 
     if (recorded && !config_path) {
-        /* Everything replay_run reads is in the recorded set; the pool and
-         * latch are fixed by analog_dev_stub, whatever a config says. */
+        /* Everything replay_run reads is in the recorded set; no config
+         * file is needed. */
         for (size_t i = 0; i < N_REC_KEYS; i++)
             memcpy((char *)&cfg.analog + rec_keys[i].off,
                    (char *)&tr.rec + rec_keys[i].off,

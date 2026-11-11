@@ -8,8 +8,7 @@ rapid-fire, gap-free key alternation on any keyboard.
 
 `doubletapd` exclusively grabs your keyboard(s) at the evdev level — before
 Xorg/Wayland ever see the events — applies a SOCD (Simultaneous Opposing
-Cardinal Directions) state machine to a *pool* of configurable physical keys
-(two by default, up to 16) that all drive the same two virtual keys, and
+Cardinal Directions) state machine to two configurable physical keys, and
 re-emits everything through a single virtual uinput keyboard. All other keys
 pass through untouched. It also plays a click sound through PipeWire on every
 virtual keypress, so you get tactile-style audio feedback even on the
@@ -30,20 +29,13 @@ re-pressed key.
     on the backplate and you get the toggle for rocking, tap and you get
     the plain remap. Adds a software rapid trigger. Requires an analog
     keyboard; see [Analog mode](#analog-mode).
-  - `off` — no SOCD cleaning: the pool keys are simply remapped to v1/v2,
-    and the audio click still plays on each press. With a pool larger than
-    two this also drops the sticky rule, so repeated taps of one key
-    alternate v1/v2 instead of repeating.
+  - `off` — no SOCD cleaning: k1/k2 are simply remapped to v1/v2, and the
+    audio click still plays on each press.
 - **Kernel-level grab** — devices are grabbed exclusively via
   `EVIOCGRAB`, so the raw (uncleaned) events never leak to the compositor
   or the game. Works identically under Xorg and Wayland.
-- **Key pool** — the physical side is a pool of up to 16 keys, all driving
-  the same two virtual keys; which of the two a key gets is decided per
-  press, not fixed in the config. Any sequence of distinct pool keys comes
-  out as clean alternation. A two-key pool is the default and behaves
-  exactly as the old fixed `k1`/`k2` pair. See [Key pool](#key-pool).
 - **Auto-discovery + hotplug** — by default every keyboard-shaped device
-  advertising *every* pool key is grabbed; unplugged keyboards are dropped
+  advertising both configured keys is grabbed; unplugged keyboards are dropped
   and re-grabbed on replug (inotify-driven). You can also pin an explicit
   device list.
 - **Multiple keyboards** — each physical keyboard gets its own independent
@@ -125,20 +117,17 @@ schema. The short version:
 
 ```yaml
 # Omit `devices` (or set it to "auto") to grab every real keyboard that has
-# every pool key. To pin specific keyboards, use stable by-id paths:
+# both configured keys. To pin specific keyboards, use stable by-id paths:
 # devices:
 #   - /dev/input/by-id/usb-Your_Keyboard-event-kbd
 
 socd: toggle          # or "snappy" / "analog" / "off" ("on" = "toggle")
 
-keys:                 # physical pool -> virtual v1/v2
+keys:                 # physical k1/k2 -> virtual v1/v2
   k1: KEY_Z           # symbolic KEY_* names or numeric codes
   k2: KEY_X
   v1: KEY_Z
   v2: KEY_X
-  # pool: [KEY_Z, KEY_X, KEY_C, KEY_V]   # instead of k1/k2, up to 16
-  # latch: [KEY_Z, KEY_X]                # analog only; defaults to the
-                                         # first two pool keys
 
 audio:
   enabled: true
@@ -163,31 +152,6 @@ After editing, restart the daemon:
 ```sh
 systemctl --user restart doubletap
 ```
-
-### Key pool
-
-`v1`/`v2` — the two keys the daemon actually emits — are fixed. The physical
-side is not: `keys.pool` takes anything from two to sixteen keys, and every
-one of them drives those same two virtual keys. `k1`/`k2` are just the
-two-entry spelling of `pool`, and remain the default.
-
-Which of the two a key gets is decided per press, in this order:
-
-1. **Sticky.** A key reuses the virtual it drove last time, whenever that one
-   is free. So a key tapped on its own always gives the same virtual — and a
-   two-key pool behaves exactly as `k1`/`k2` always did.
-2. **Otherwise the free one.** This is what makes any sequence of distinct
-   keys alternate: `Z X C V` comes out `v1 v2 v1 v2`, and so does `C V C V`.
-3. **If both are held** — a third key down at once — the newcomer alternates
-   off the last press and *shares* that virtual. It still counts as a press,
-   so the toggle fires for it; its release does nothing while the key sharing
-   with it is still down.
-
-Pool keys are **consumed**: a pool key emits only `v1`/`v2`, never its own
-code. Everything outside the pool passes through untouched. Auto-discovery
-grabs a keyboard only if it advertises *every* pool key — the pool alternates
-across all of it, so a board carrying only part of it would alternate against
-keys it cannot see.
 
 ## Analog mode
 
@@ -225,8 +189,8 @@ defining shape is one finger leaving as the other arrives, however fast you
 play and however much the presses overlap in the middle of travel. Rocking,
 by contrast, *begins* by planting both; you cannot start one any other way.
 
-So: `deep` **arms** when both latch keys are on the backplate in one report,
-and the pool switches to the toggle. It **disarms** when **both** of them are
+So: `deep` **arms** when both keys are on the backplate in one report,
+and they switch to the toggle. It **disarms** when **both** of them are
 back off the backplate, and the keys switch back to the plain remap. Until it
 arms, they are completely independent.
 
@@ -236,13 +200,6 @@ would push the next note through the tapping profile at `actuation_mm` and
 land it early. Two thresholds inside one burst is a limp, and "how completely
 you lift" is exactly the kind of amplitude-driven rule this design rejects
 everywhere else.
-
-The pair that arms it is `keys.latch`, defaulting to the first two pool keys.
-With a larger pool every key is still read by travel — so the daemon's own
-rapid trigger governs all of them, rather than half of them running the
-firmware's actuation instead — but only the latch pair can arm the latch, and
-the rest go **silent** for the duration of a rock. While it is armed, the two
-latch keys own both virtuals.
 
 Because the backplate is a hard physical stop, this is a trigger you can
 *aim*: "plant both keys to start rocking" is an instruction you can
@@ -306,10 +263,8 @@ gone; the daemon warns and ignores them if it finds them in a config.
 
 ### Recording and replaying a session
 
-`-T` writes the travel of the **latch pair** to stdout, one line per hardware
-report, until Ctrl-C. It stays two columns wide (`us,k1_mm,k2_mm`) whatever
-the pool's size — the rest of the pool cannot arm the latch, and keeping the
-format fixed is what lets the recorded traces stay comparable.
+`-T` writes the travel of k1/k2 to stdout, one line per hardware report
+(`us,k1_mm,k2_mm`), until Ctrl-C.
 
 Like `-A` it is completely passive — it opens the keyboard's hidraw node and
 nothing else, so there is no grab, no virtual device, and nothing in the
@@ -368,9 +323,8 @@ fingers actually rest when riding.
 
 It also prints each key's **HID usage id** alongside its name. The daemon
 derives those from the keyboard's own keymap, so you should not need them —
-but if a key comes out wrong you can pin them with `analog.hid`, a list
-parallel to `keys.pool` (`analog.hid_k1` / `hid_k2` are its two-key
-spelling).
+but if a key comes out wrong you can pin them with `analog.hid_k1` /
+`analog.hid_k2`.
 
 ### Requirements and caveats
 
@@ -419,27 +373,22 @@ Handy for trying config changes before restarting the service:
 1. **Grab** — keyboards are opened via libevdev and exclusively grabbed, so
    nothing else on the system sees their raw events. The daemon refuses to
    grab its own virtual output (that would be an instant feedback loop).
-2. **Assign a slot** — the pool layer picks which of the two virtual keys an
-   incoming pool key drives (sticky → free → share off the last press). The
-   state machine below it has always had two *slots*, not two keys; with the
-   default two-key pool there is one key per slot and the distinction never
-   shows.
-3. **Filter** — a per-device radio-button state machine tracks the two slots
-   and whichever virtual key is currently active. Pressing into the second
-   slot while the first is held releases the first virtual key and presses
+2. **Filter** — a per-device radio-button state machine tracks the two keys
+   and whichever virtual key is currently active. Pressing the second
+   key while the first is held releases the first virtual key and presses
    the second ("release-then-press", always separated by `SYN_REPORT`s).
-   Releasing a key while the other slot is still held re-presses the other
+   Releasing a key while the other is still held re-presses the other
    virtual key (in `toggle` mode; `snappy` only does this when the active
    key was released). In `off` mode the state machine is bypassed entirely
-   and each slot is remapped one-to-one to v1/v2. In `analog` mode the
-   digital events for every pool key on that keyboard are dropped and the
+   and k1/k2 are remapped one-to-one to v1/v2. In `analog` mode the
+   digital events for k1/k2 on that keyboard are dropped and the
    same state machine is driven instead by press/release edges synthesized
    from travel depth, read from the keyboard's analog hidraw interface on
    the same epoll loop.
-4. **Re-emit** — everything flows out through one uinput virtual keyboard
+3. **Re-emit** — everything flows out through one uinput virtual keyboard
    with a full keyboard-wide key set, so hotplugged keyboards with unusual
-   keys still work. Non-pool events are mirrored verbatim.
-5. **Click** — each virtual key-down triggers the WAV sample on a PipeWire
+   keys still work. All other events are mirrored verbatim.
+4. **Click** — each virtual key-down triggers the WAV sample on a PipeWire
    realtime thread; overlapping triggers restart the sample from the top.
 
 ## Development
@@ -449,26 +398,11 @@ daemon's real state machine rather than a copy that could drift. Both build
 as part of `all`, deliberately — the guarantee is worthless if the binaries
 can go stale.
 
-- `build/regimetest` — assertions over the `deep` latch, its mode
-  transitions, and the slot layer (alternation, third-key sharing, arming
-  eviction, latch-pair canonicalisation, autorepeat).
+- `build/regimetest` — assertions over the `deep` latch and its mode
+  transitions.
 - `build/replay` — replays a `-T` trace through the analog front end, and
   sweeps `bottom_out_mm` so you can see how the backplate's width moves the
   latch count.
-
-`tools/e2e.py` is the outside-in counterpart: it runs the real binary against
-synthetic uinput keyboards via `-i DIR` and asserts on what comes out of the
-daemon's own virtual device, so it is the only thing covering the grab, the
-epoll loop, auto-discovery and the uinput write path as a whole.
-
-```sh
-python3 tools/e2e.py          # --keep-going to run past the first failure
-```
-
-It needs `python-evdev` and membership of the `input` group. If *every*
-assertion comes back empty, check `pgrep -af doubletapd` — a running
-`doubletap.service` auto-grabs any keyboard advertising its configured keys,
-and will take the synthetic device away from the daemon under test.
 
 ## Fair play
 
