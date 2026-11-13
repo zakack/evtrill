@@ -47,7 +47,7 @@ The whole thing is a single-file C11 daemon (`doubletapd.c`).
 - Linux with evdev + uinput (any remotely modern kernel)
 - [libevdev](https://www.freedesktop.org/wiki/Software/libevdev/)
 - [libyaml](https://pyyaml.org/wiki/LibYAML)
-- CMake ≥ 3.10, a C11 compiler, and `pkg-config` to build
+- CMake ≥ 3.13, a C11 compiler, and `pkg-config` to build
 
 ## Installation
 
@@ -109,17 +109,15 @@ schema. The short version:
 
 ```yaml
 # Omit `devices` (or set it to "auto") to grab every real keyboard that has
-# both configured keys. To pin specific keyboards, use stable by-id paths:
+# every pair's keys. To pin specific keyboards, use stable by-id paths:
 # devices:
 #   - /dev/input/by-id/usb-Your_Keyboard-event-kbd
 
-socd: toggle          # or "snappy" / "analog" / "off" ("on" = "toggle")
+socd: toggle          # default for every pair: "snappy" / "analog" / "off"
+                      # ("on" = "toggle")
 
-keys:                 # physical k1/k2 -> virtual v1/v2
-  k1: KEY_Z           # symbolic KEY_* names or numeric codes
-  k2: KEY_X
-  v1: KEY_Z
-  v2: KEY_X
+pairs:                # required: physical k1/k2 -> virtual v1/v2
+  - { k1: KEY_Z, k2: KEY_X, v1: KEY_Z, v2: KEY_X }   # KEY_* names or codes
 
 uinput:
   name: "doubletap virtual keyboard"
@@ -131,7 +129,7 @@ uinput:
 ```
 
 More than one pair of keys can run at once, each with its own state machine
-and mode. Replace `keys` with a `pairs` list (up to 8):
+and mode (up to 8):
 
 ```yaml
 pairs:                # osu!taiko: dons rock, kats remap
@@ -141,7 +139,11 @@ pairs:                # osu!taiko: dons rock, kats remap
 
 Pairs are fully independent: no key may be in two pairs, and keys from
 different pairs never interact. `socd` on a pair defaults to the top-level
-one. See [`config.yaml`](config.yaml) for the details.
+one.
+
+The schema is closed: an unknown or repeated key anywhere in the file is an
+error that stops the daemon, so a typo never silently runs it on defaults.
+See [`config.yaml`](config.yaml) for the details.
 
 After editing, restart the daemon:
 
@@ -319,8 +321,8 @@ fingers actually rest when riding.
 
 It also prints each key's **HID usage id** alongside its name. The daemon
 derives those from the keyboard's own keymap, so you should not need them —
-but if a key comes out wrong you can pin them with `analog.hid_k1` /
-`analog.hid_k2`.
+but if a key comes out wrong you can pin them with `hid_k1` / `hid_k2` on
+the pair.
 
 ### Requirements and caveats
 

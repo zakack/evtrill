@@ -903,35 +903,80 @@ skip_w:
         #undef KEY
     }
 
-    puts("Y. config: the legacy spelling is pair 0, and pairs share nothing");
+    puts("Y. config: a closed schema, and pairs share nothing");
     {
-        static const struct { const char *what, *yaml; int ok, n; } cf[] = {
-            { "keys: is one pair, socd and analog.hid_* its own",
-              "socd: analog\nkeys: {k1: KEY_Z, k2: KEY_X, v1: KEY_Z, "
-              "v2: KEY_X}\nanalog: {hid_k1: 0x1d}\n", 1, 1 },
-            { "pairs: two entries, socd defaulted from the top",
+        /* `msg` must appear in what a refusal logs, so a case cannot pass
+         * by being refused for some unrelated reason. */
+        #define PAIR_FJ "  - {k1: KEY_F, k2: KEY_J, v1: KEY_1, v2: KEY_2}\n"
+        static const struct { const char *what, *yaml; int ok, n;
+                              const char *msg; } cf[] = {
+            { "one pair, with its socd and a hid override",
+              "pairs:\n  - {k1: KEY_Z, k2: KEY_X, v1: KEY_Z, v2: KEY_X, "
+              "socd: analog, hid_k1: 0x1d}\n", 1, 1, NULL },
+            { "two pairs, socd defaulted from the top",
               "socd: snappy\npairs:\n"
               "  - {k1: KEY_F, k2: KEY_J, v1: KEY_F, v2: KEY_J, socd: analog}\n"
-              "  - {k1: KEY_D, k2: KEY_K, v1: KEY_D, v2: KEY_K}\n", 1, 2 },
-            { "keys: and pairs: together is refused",
-              "keys: {k1: KEY_Z}\npairs:\n"
-              "  - {k1: KEY_F, k2: KEY_J, v1: KEY_F, v2: KEY_J}\n", 0, 0 },
+              "  - {k1: KEY_D, k2: KEY_K, v1: KEY_D, v2: KEY_K}\n", 1, 2, NULL },
+            { "no pairs: is refused - there is no built-in pair",
+              "socd: toggle\n", 0, 0, "'pairs' is required" },
+            { "a typo at the root is refused",
+              "pair:\n" PAIR_FJ, 0, 0, "unknown key 'pair'" },
+            { "the old keys: spelling is just an unknown key",
+              "keys: {k1: KEY_Z, k2: KEY_X}\npairs:\n" PAIR_FJ, 0, 0,
+              "unknown key 'keys'" },
+            { "an old audio: block is just an unknown key",
+              "audio: {enabled: true}\npairs:\n" PAIR_FJ, 0, 0,
+              "unknown key 'audio'" },
+            { "an unknown key on a pair is refused",
+              "pairs:\n  - {k1: KEY_F, k2: KEY_J, v1: KEY_1, v2: KEY_2, "
+              "scod: off}\n", 0, 0, "unknown key 'pairs[0].scod'" },
+            { "an unknown key under analog is refused",
+              "pairs:\n" PAIR_FJ "analog: {gate: true}\n", 0, 0,
+              "unknown key 'analog.gate'" },
+            { "analog.hid_k1 is refused: overrides live on the pair",
+              "pairs:\n" PAIR_FJ "analog: {hid_k1: 0x09}\n", 0, 0,
+              "unknown key 'analog.hid_k1'" },
+            { "an unknown key under rapid_trigger is refused",
+              "pairs:\n" PAIR_FJ "analog: {rapid_trigger: "
+              "{deep_press_mm: 1}}\n", 0, 0,
+              "unknown key 'analog.rapid_trigger.deep_press_mm'" },
+            { "an unknown key under uinput is refused",
+              "pairs:\n" PAIR_FJ "uinput: {nmae: x}\n", 0, 0,
+              "unknown key 'uinput.nmae'" },
+            { "a key given twice is refused",
+              "socd: off\nsocd: toggle\npairs:\n" PAIR_FJ, 0, 0,
+              "'socd' is given more than once" },
             { "a physical key in two pairs is refused",
-              "pairs:\n  - {k1: KEY_F, k2: KEY_J, v1: KEY_1, v2: KEY_2}\n"
-              "  - {k1: KEY_J, k2: KEY_K, v1: KEY_3, v2: KEY_4}\n", 0, 0 },
+              "pairs:\n" PAIR_FJ
+              "  - {k1: KEY_J, k2: KEY_K, v1: KEY_3, v2: KEY_4}\n", 0, 0,
+              "share a physical key" },
             { "a virtual key in two pairs is refused",
-              "pairs:\n  - {k1: KEY_F, k2: KEY_J, v1: KEY_1, v2: KEY_2}\n"
-              "  - {k1: KEY_D, k2: KEY_K, v1: KEY_2, v2: KEY_3}\n", 0, 0 },
+              "pairs:\n" PAIR_FJ
+              "  - {k1: KEY_D, k2: KEY_K, v1: KEY_2, v2: KEY_3}\n", 0, 0,
+              "share a virtual key" },
+            { "one hid override in two pairs is refused",
+              "pairs:\n"
+              "  - {k1: KEY_F, k2: KEY_J, v1: KEY_1, v2: KEY_2, hid_k1: 9}\n"
+              "  - {k1: KEY_D, k2: KEY_K, v1: KEY_3, v2: KEY_4, hid_k2: 9}\n",
+              0, 0, "both override a key to hid 0x09" },
+            { "hid usage 0 is refused",
+              "pairs:\n  - {k1: KEY_F, k2: KEY_J, v1: KEY_1, v2: KEY_2, "
+              "hid_k1: 0}\n", 0, 0, "'pairs[0].hid_k1' must be" },
             { "a pair entry missing a key is refused",
-              "pairs:\n  - {k1: KEY_F, k2: KEY_J, v1: KEY_1}\n", 0, 0 },
-            { "analog.hid_k1 with pairs: is refused (ambiguous)",
-              "pairs:\n  - {k1: KEY_F, k2: KEY_J, v1: KEY_1, v2: KEY_2}\n"
-              "analog: {hid_k1: 0x09}\n", 0, 0 },
+              "pairs:\n  - {k1: KEY_F, k2: KEY_J, v1: KEY_1}\n", 0, 0,
+              "'pairs[0].v2' is required" },
         };
+        #undef PAIR_FJ
         char path[] = "/tmp/regimetest-XXXXXX";
+        char errp[] = "/tmp/regimetest-err-XXXXXX";
         int  tfd = mkstemp(path);
-        for (size_t i = 0; tfd >= 0 && i < sizeof cf / sizeof cf[0]; i++) {
-            if (ftruncate(tfd, 0) != 0 ||
+        int  efd = mkstemp(errp);
+        for (size_t i = 0; tfd >= 0 && efd >= 0 &&
+                           i < sizeof cf / sizeof cf[0]; i++) {
+            /* ftruncate leaves the offset where it was; rewind, or the next
+             * log lands past a run of NULs and reads back as empty. */
+            if (ftruncate(tfd, 0) != 0 || ftruncate(efd, 0) != 0 ||
+                lseek(efd, 0, SEEK_SET) != 0 ||
                 pwrite(tfd, cf[i].yaml, strlen(cf[i].yaml), 0) < 0) {
                 printf("  FAIL could not write %s\n", path);
                 fails++;
@@ -940,18 +985,30 @@ skip_w:
             oid_config_t yc;
             config_init(&yc);
             g_log_quiet = 1;
-            int saved = dup(2), devnull = open("/dev/null", O_WRONLY);
-            dup2(devnull, 2);            /* the refusals log errors */
+            fflush(stderr);
+            int saved = dup(2);
+            dup2(efd, 2);                /* capture what the refusal says */
             int rc = load_config(path, &yc);
+            fflush(stderr);
             dup2(saved, 2);
             close(saved);
-            close(devnull);
             expect_int(cf[i].what, rc == 0, cf[i].ok);
+            if (cf[i].msg) {
+                char buf[2048] = "";
+                ssize_t got = pread(efd, buf, sizeof buf - 1, 0);
+                buf[got > 0 ? got : 0] = '\0';
+                if (!strstr(buf, cf[i].msg)) {
+                    printf("  FAIL   says \"%s\", logged: %s\n",
+                           cf[i].msg, buf);
+                    fails++;
+                }
+            }
             if (rc == 0 && cf[i].ok) {
                 expect_int("  pair count", yc.n_pairs, cf[i].n);
                 if (i == 0)
-                    expect_int("  hid_k1 landed on pair 0",
+                    expect_int("  socd and hid_k1 on the pair",
                                yc.pair[0].hid_k1 == 0x1d &&
+                               yc.pair[0].hid_k2 == -1 &&
                                yc.pair[0].socd == SOCD_ANALOG, 1);
                 if (i == 1)
                     expect_int("  per-pair socd, and the default",
@@ -961,6 +1018,7 @@ skip_w:
             }
         }
         if (tfd >= 0) { close(tfd); unlink(path); }
+        if (efd >= 0) { close(efd); unlink(errp); }
     }
 
     printf("\n%s\n", fails ? "FAILURES ABOVE" : "all assertions passed");

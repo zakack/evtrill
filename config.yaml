@@ -1,10 +1,14 @@
 # doubletap configuration
 #
 # The daemon grabs keyboard devices (auto-discovered, or an explicit list),
-# applies a SOCD-cleaning state machine to two configurable keys
+# applies a SOCD-cleaning state machine to each configured pair of keys
 # (k1/k2 -> v1/v2), and re-emits everything via a single uinput virtual
 # keyboard. Devices are hotplug-aware either way: unplugged keyboards are
 # dropped and re-grabbed when they come back.
+#
+# The schema is closed: an unknown or repeated key anywhere is an error,
+# not something to skip, so a typo stops the daemon instead of running it
+# on defaults.
 #
 # Copy this file to ~/.config/doubletap/config.yaml and edit it there;
 # the daemon prefers that path over the installed copy in /usr/share.
@@ -12,7 +16,7 @@
 #   systemctl --user restart doubletap
 
 # Keyboard devices to grab. OPTIONAL. When omitted (or set to the scalar
-# "auto"), every keyboard-shaped device that has both k1 and k2 is grabbed
+# "auto"), every keyboard-shaped device that has every pair's keys is grabbed
 # automatically: real keyboards only (no mice/touchpads, no other virtual
 # keyboards such as those created by keyd or doubletap itself).
 #
@@ -23,7 +27,8 @@
 # devices:
 #   - /dev/input/by-id/CHANGE-ME-event-kbd
 
-# SOCD-cleaning mode. toggle and snappy both suppress the older key when
+# SOCD-cleaning mode, the default for every pair that does not set its own.
+# OPTIONAL, default toggle. toggle and snappy both suppress the older key when
 # both are held; they differ in what happens when one of two held keys is
 # released:
 #   toggle - reverting toggle (latching): releasing EITHER key re-presses
@@ -38,25 +43,23 @@
 #            `toggle` (with a warning) if no analog device is found.
 socd: toggle
 
-# Key mapping. Codes can be symbolic ("KEY_Z") or numeric (44).
-# See /usr/include/linux/input-event-codes.h for the full list.
-keys:
-  k1: KEY_Z
-  k2: KEY_X
-  v1: KEY_Z
-  v2: KEY_X
-
-# More than one pair. OPTIONAL, and instead of `keys` (not alongside it).
-# Each pair is its own state machine with its own mode, driving its own two
-# virtual keys; pairs never see each other's keys, so a key from one pair
-# and a key from another held together are two notes, never a rock. Up to
-# 8 pairs. Every pair needs k1/k2/v1/v2; `socd` defaults to the top-level
-# one above; hid_k1/hid_k2 (see `analog`) go on the pair rather than under
-# `analog`. No key, physical or virtual, may appear in two pairs. In
-# analog mode every analog pair has its own `deep` latch but shares the
-# thresholds below - they describe the board. Auto-discovery grabs only
-# keyboards that have every pair's keys.
+# The key pairs. REQUIRED: there is no built-in pair. Each pair maps two
+# physical keys (k1/k2) to two virtual keys (v1/v2) and is its own state
+# machine with its own mode, so a key from one pair and a key from another
+# held together are two notes, never a rock. Up to 8 pairs.
 #
+#   k1, k2, v1, v2  REQUIRED. Symbolic ("KEY_Z") or numeric (44); see
+#                   /usr/include/linux/input-event-codes.h for the list.
+#   socd            OPTIONAL, defaults to the top-level `socd` above.
+#   hid_k1, hid_k2  OPTIONAL, analog only: the keys' HID usage ids, derived
+#                   from the keyboard's own keymap unless pinned (see -A).
+#
+# No key, physical or virtual, may appear in two pairs. In analog mode
+# every analog pair has its own `deep` latch but shares the thresholds
+# below - they describe the board.
+pairs:
+  - { k1: KEY_Z, k2: KEY_X, v1: KEY_Z, v2: KEY_X }
+
 # osu!taiko, dons rocking on the analog latch, kats on a plain remap:
 #
 # pairs:
@@ -67,7 +70,7 @@ keys:
 # a non-zero analog.latch_debounce_ms: the strike is an instant, so it
 # never arms the latch and both notes pass through as plain presses.
 
-# Analog mode (socd: analog). OPTIONAL - ignored by every other mode.
+# Analog mode (socd: analog on any pair). OPTIONAL - ignored otherwise.
 #
 # Analog keyboards report how far each key is pressed, not just whether it
 # is down. That lets one session serve BOTH play patterns instead of making
@@ -149,8 +152,6 @@ keys:
 #                         # it is the ONLY threshold. Must be > 0; keep
 #                         # it under ~10% of travel, or a firm tap can
 #                         # reach it and alt-tapping may arm the latch.
-#   hid_k1: auto          # HID usage ids; derived from the keyboard's own
-#   hid_k2: auto          # keymap unless pinned here (see -A)
 
 # Identification of the virtual uinput keyboard.
 uinput:

@@ -255,6 +255,47 @@ static yaml_node_t* map_get(yaml_document_t *doc, yaml_node_t *map, const char *
     return NULL;
 }
 
+/* The schema is closed: every mapping in the config is checked against the
+ * keys it may hold, and anything else is an error, as is a key given twice
+ * (libyaml keeps both and map_get would silently take the first). A typo
+ * like `pair:` for `pairs:` must stop the daemon, not run it on defaults.
+ * `allowed` is NULL-terminated; `where` names the mapping in the message
+ * ("" for the root). */
+static int map_check(yaml_document_t *doc, yaml_node_t *map,
+                     const char *where, const char *const *allowed) {
+    int bad = 0;
+    for (yaml_node_pair_t *p = map->data.mapping.pairs.start;
+         p < map->data.mapping.pairs.top; p++) {
+        yaml_node_t *k = ynode(doc, p->key);
+        if (!k || k->type != YAML_SCALAR_NODE) {
+            LOG_ERR("'%s' has a key that is not a plain string",
+                    *where ? where : "config");
+            bad = 1;
+            continue;
+        }
+        const char *name = (const char *)k->data.scalar.value;
+        int known = 0;
+        for (const char *const *a = allowed; *a; a++)
+            if (strcmp(*a, name) == 0) { known = 1; break; }
+        if (!known) {
+            LOG_ERR("unknown key '%s%s%s'", where, *where ? "." : "", name);
+            bad = 1;
+            continue;
+        }
+        for (yaml_node_pair_t *q = map->data.mapping.pairs.start; q < p; q++) {
+            yaml_node_t *qk = ynode(doc, q->key);
+            if (qk && qk->type == YAML_SCALAR_NODE &&
+                strcmp((const char *)qk->data.scalar.value, name) == 0) {
+                LOG_ERR("key '%s%s%s' is given more than once",
+                        where, *where ? "." : "", name);
+                bad = 1;
+                break;
+            }
+        }
+    }
+    return bad ? -1 : 0;
+}
+
 static int scalar_dup(yaml_node_t *n, char **out) {
     if (!n || n->type != YAML_SCALAR_NODE) return -1;
     char *s = strdup((const char *)n->data.scalar.value);
@@ -287,8 +328,6 @@ static int parse_nonneg(yaml_node_t *n, float *out) {
     return 0;
 }
 
-/* Fill in the deep profile from the tapping profile wherever the config
- * left it unset, so everything downstream reads concrete numbers. */
 /* Hysteresis as a fraction of actuation, and the shallowest derived
  * release worth trusting: a Wooting's firmware stops reporting a key a few
  * hundredths of a millimetre from rest, and a release threshold underneath
@@ -325,8 +364,6 @@ static int analog_config_check(const analog_config_t *a) {
                 "otherwise a held key releases itself");
         bad = 1;
     }
-    /* Nothing could ever re-press a key in the riding zone: travel is
-     * switched off and there is no backplate rule to fall back on. */
     /* The backplate is load-bearing now: it defines the gesture, not just
      * a rapid-trigger corner case. */
     if (a->bottom_out_mm <= 0.0f) {
@@ -335,10 +372,9 @@ static int analog_config_check(const analog_config_t *a) {
                 "reaching it is what arms the deep latch");
         bad = 1;
     }
-    /* Actuation has to sit above the backplate, and the deep latch makes
-     * this load-bearing rather than merely tidy: actuation_mm is what
-     * DISARMS the latch, so an actuation line at or below the backplate
-     * would disarm it on the very sample it armed, and with actuation past
+    /* Actuation has to sit above the backplate: with the line at or past
+     * the floor a key could reach the backplate without ever having
+     * actuated, so the plain remap would never press it, and with it past
      * travel_mm the key could never actuate at all. Both are silent
      * bricks. */
     if (a->travel_mm > 0.0f && a->bottom_out_mm > 0.0f &&
@@ -367,10 +403,6 @@ static int analog_config_check(const analog_config_t *a) {
                  "a resting key may never count as released",
                  (double)a->actuation_mm, (double)a->release_mm,
                  (double)ANALOG_RELEASE_FLOOR);
-    if (a->bottom_out_mm >= a->travel_mm)
-        LOG_WARN("'analog.rapid_trigger.bottom_out_mm' (%.3f) >= travel_mm "
-                 "(%.3f): every sample counts as bottomed out",
-                 (double)a->bottom_out_mm, (double)a->travel_mm);
     /* A backplate under 90% of travel is reachable by a firm tap, and a tap
      * that reaches it is a tap that can arm the latch - which is exactly the
      * alt-tapping misfire the latch exists to avoid. */
@@ -425,7 +457,8 @@ static int parse_socd(yaml_node_t *n, int *out) {
     return 0;
 }
 
-/* A HID usage override: "auto" (leave the -1 sentinel) or a usage id. */
+/* A HID usage override: "auto" (leave the -1 sentinel) or a usage id.
+ * Usage 0 is HID's "no event" and never names a key. */
 static int parse_hid(yaml_node_t *n, int *out) {
     const char *s = n && n->type == YAML_SCALAR_NODE
                     ? (const char *)n->data.scalar.value : "";
@@ -434,33 +467,14 @@ static int parse_hid(yaml_node_t *n, int *out) {
     char *end = NULL;
     errno = 0;
     long u = strtol(s, &end, 0);
-    if (end == s || *end != '\0' || errno != 0 || u < 0 || u > 0xFFFF)
+    if (end == s || *end != '\0' || errno != 0 || u <= 0 || u > 0xFFFF)
         return -1;
     *out = (int)u;
     return 0;
 }
 
-/* k1/k2/v1/v2 out of one mapping - `keys:` in the legacy spelling, or one
- * entry of `pairs:`. `where` names it in errors. */
-static int parse_pair_keys(yaml_document_t *doc, yaml_node_t *map,
-                           keypair_t *p, const char *where) {
-    struct { const char *name; int *out; } kmap[] = {
-        { "k1", &p->k1 }, { "k2", &p->k2 },
-        { "v1", &p->v1 }, { "v2", &p->v2 },
-    };
-    for (size_t i = 0; i < sizeof(kmap)/sizeof(kmap[0]); i++) {
-        yaml_node_t *kn = map_get(doc, map, kmap[i].name);
-        if (kn && parse_key_code(kn, kmap[i].out) != 0) {
-            LOG_ERR("invalid key code for '%s.%s'", where, kmap[i].name);
-            return -1;
-        }
-    }
-    return 0;
-}
-
-/* One entry of `pairs:`. Every key is required - there is no sensible
- * default for a second pair's keys - except `socd`, which falls back to the
- * top-level one, and the HID overrides. */
+/* One entry of `pairs:`. The four keys are required - there is no sensible
+ * default for a pair's keys - and `socd` falls back to the top-level one. */
 static int parse_pair_entry(yaml_document_t *doc, yaml_node_t *map,
                             keypair_t *p, int idx, int def_socd) {
     char where[32];
@@ -469,16 +483,28 @@ static int parse_pair_entry(yaml_document_t *doc, yaml_node_t *map,
         LOG_ERR("'%s' must be a mapping", where);
         return -1;
     }
-    static const char *req[] = { "k1", "k2", "v1", "v2" };
-    for (size_t i = 0; i < sizeof(req)/sizeof(req[0]); i++)
-        if (!map_get(doc, map, req[i])) {
-            LOG_ERR("'%s.%s' is required", where, req[i]);
-            return -1;
-        }
+    static const char *const allowed[] = {
+        "k1", "k2", "v1", "v2", "socd", "hid_k1", "hid_k2", NULL
+    };
+    if (map_check(doc, map, where, allowed) != 0)
+        return -1;
     p->socd   = def_socd;
     p->hid_k1 = p->hid_k2 = -1;
-    if (parse_pair_keys(doc, map, p, where) != 0)
-        return -1;
+    struct { const char *name; int *out; } kmap[] = {
+        { "k1", &p->k1 }, { "k2", &p->k2 },
+        { "v1", &p->v1 }, { "v2", &p->v2 },
+    };
+    for (size_t i = 0; i < sizeof(kmap)/sizeof(kmap[0]); i++) {
+        yaml_node_t *kn = map_get(doc, map, kmap[i].name);
+        if (!kn) {
+            LOG_ERR("'%s.%s' is required", where, kmap[i].name);
+            return -1;
+        }
+        if (parse_key_code(kn, kmap[i].out) != 0) {
+            LOG_ERR("invalid key code for '%s.%s'", where, kmap[i].name);
+            return -1;
+        }
+    }
     yaml_node_t *sn = map_get(doc, map, "socd");
     if (sn && parse_socd(sn, &p->socd) != 0) {
         LOG_ERR("'%s.socd' must be \"toggle\"/\"on\", \"snappy\", "
@@ -526,6 +552,17 @@ static int pairs_check(const oid_config_t *c) {
         }
         for (int j = i + 1; j < c->n_pairs; j++) {
             const keypair_t *b = &c->pair[j];
+            /* Overrides only; a collision involving a keymap-derived usage
+             * can only be seen once the board is open (analog_dev_open). */
+            const int ha[2] = { a->hid_k1, a->hid_k2 };
+            const int hb[2] = { b->hid_k1, b->hid_k2 };
+            for (int x = 0; x < 2; x++)
+                for (int y = 0; y < 2; y++)
+                    if (ha[x] >= 0 && ha[x] == hb[y]) {
+                        LOG_ERR("pairs %d and %d both override a key to hid "
+                                "0x%02x", i, j, ha[x]);
+                        bad = 1;
+                    }
             if (a->k1 == b->k1 || a->k1 == b->k2 ||
                 a->k2 == b->k1 || a->k2 == b->k2) {
                 LOG_ERR("pairs %d and %d share a physical key", i, j);
@@ -579,10 +616,15 @@ static int load_config(const char *path, oid_config_t *c) {
         LOG_ERR("config root must be a mapping");
         goto out;
     }
+    static const char *const root_keys[] = {
+        "devices", "socd", "pairs", "analog", "uinput", NULL
+    };
+    if (map_check(&doc, root, "", root_keys) != 0)
+        goto out;
 
     /* devices: optional sequence of scalar paths. Omitted (or the scalar
      * "auto") means auto-discovery: grab every keyboard-shaped device that
-     * advertises both k1 and k2 (see auto_grab_ok). ------------------- */
+     * advertises every pair's keys (see auto_grab_ok). --------------- */
     yaml_node_t *devs = map_get(&doc, root, "devices");
     if (!devs ||
         (devs->type == YAML_SCALAR_NODE &&
@@ -611,12 +653,8 @@ static int load_config(const char *path, oid_config_t *c) {
         }
     }
 
-    /* socd: optional scalar - the mode of the legacy single pair, and the
-     * default for every `pairs:` entry that does not name its own. */
-    if (map_get(&doc, root, "mode")) {
-        LOG_ERR("'mode' has been renamed to 'socd'");
-        goto out;
-    }
+    /* socd: optional scalar - the default for every `pairs:` entry that
+     * does not name its own. */
     int def_socd = SOCD_TOGGLE;
     yaml_node_t *socd = map_get(&doc, root, "socd");
     if (socd && parse_socd(socd, &def_socd) != 0) {
@@ -625,48 +663,30 @@ static int load_config(const char *path, oid_config_t *c) {
         goto out;
     }
 
-    /* keys / pairs. `keys:` is the single-pair spelling every existing
-     * config uses, and it stays exactly that: pair 0, with `socd` and
-     * `analog.hid_k1`/`hid_k2` as its mode and overrides. `pairs:` is the
-     * general form. Both at once is ambiguous about which is pair 0. */
-    yaml_node_t *keys  = map_get(&doc, root, "keys");
+    /* pairs: required. There is no built-in pair - which keys to take over
+     * is the one thing a config cannot leave to a default. */
     yaml_node_t *pairs = map_get(&doc, root, "pairs");
-    int legacy = !pairs;
-    if (keys && pairs) {
-        LOG_ERR("'keys' and 'pairs' are exclusive: 'keys' is the "
-                "single-pair spelling of 'pairs'");
+    if (!pairs) {
+        LOG_ERR("'pairs' is required: list at least one pair of keys");
         goto out;
     }
-    if (legacy) {
-        c->pair[0].socd = def_socd;
-        if (keys) {
-            if (keys->type != YAML_MAPPING_NODE) {
-                LOG_ERR("'keys' must be a mapping");
-                goto out;
-            }
-            if (parse_pair_keys(&doc, keys, &c->pair[0], "keys") != 0)
-                goto out;
-        }
-    } else {
-        if (pairs->type != YAML_SEQUENCE_NODE) {
-            LOG_ERR("'pairs' must be a sequence of mappings");
+    if (pairs->type != YAML_SEQUENCE_NODE) {
+        LOG_ERR("'pairs' must be a sequence of mappings");
+        goto out;
+    }
+    size_t n_pairs = (size_t)(pairs->data.sequence.items.top -
+                              pairs->data.sequence.items.start);
+    if (n_pairs == 0 || n_pairs > MAX_PAIRS) {
+        LOG_ERR("'pairs' must have between 1 and %d entries", MAX_PAIRS);
+        goto out;
+    }
+    c->n_pairs = 0;
+    for (yaml_node_item_t *it = pairs->data.sequence.items.start;
+         it < pairs->data.sequence.items.top; it++) {
+        if (parse_pair_entry(&doc, ynode(&doc, *it), &c->pair[c->n_pairs],
+                             c->n_pairs, def_socd) != 0)
             goto out;
-        }
-        size_t n = (size_t)(pairs->data.sequence.items.top -
-                            pairs->data.sequence.items.start);
-        if (n == 0 || n > MAX_PAIRS) {
-            LOG_ERR("'pairs' must have between 1 and %d entries", MAX_PAIRS);
-            goto out;
-        }
-        c->n_pairs = 0;
-        for (yaml_node_item_t *it = pairs->data.sequence.items.start;
-             it < pairs->data.sequence.items.top; it++) {
-            if (parse_pair_entry(&doc, ynode(&doc, *it),
-                                 &c->pair[c->n_pairs], c->n_pairs,
-                                 def_socd) != 0)
-                goto out;
-            c->n_pairs++;
-        }
+        c->n_pairs++;
     }
 
     /* analog: optional mapping */
@@ -676,6 +696,12 @@ static int load_config(const char *path, oid_config_t *c) {
             LOG_ERR("'analog' must be a mapping");
             goto out;
         }
+        static const char *const analog_keys[] = {
+            "device", "travel_mm", "actuation_mm", "latch_debounce_ms",
+            "rapid_trigger", NULL
+        };
+        if (map_check(&doc, an, "analog", analog_keys) != 0)
+            goto out;
         yaml_node_t *dv = map_get(&doc, an, "device");
         if (dv) {
             const char *s = dv->type == YAML_SCALAR_NODE
@@ -700,25 +726,17 @@ static int load_config(const char *path, oid_config_t *c) {
                 goto out;
             }
         }
-        /* Removed along with the gate. Warn rather than fail: a stale key
-         * in a config file should not stop the daemon starting. */
-        if (map_get(&doc, an, "gate") || map_get(&doc, an, "gate_depth_mm") ||
-            map_get(&doc, an, "gate_margin_mm") ||
-            map_get(&doc, an, "socd_depth_mm") ||
-            map_get(&doc, an, "engage") ||
-            map_get(&doc, an, "release_mm"))
-            LOG_WARN("'analog.gate', 'gate_depth_mm', 'gate_margin_mm', "
-                     "'socd_depth_mm', 'engage' and 'release_mm' were "
-                     "removed and are ignored - both keys reaching the "
-                     "backplate is what arms the deep latch, and release "
-                     "follows actuation");
-
         yaml_node_t *rt = map_get(&doc, an, "rapid_trigger");
         if (rt) {
             if (rt->type != YAML_MAPPING_NODE) {
                 LOG_ERR("'analog.rapid_trigger' must be a mapping");
                 goto out;
             }
+            static const char *const rt_keys[] = {
+                "enabled", "press_mm", "bottom_out_mm", "release_mm", NULL
+            };
+            if (map_check(&doc, rt, "analog.rapid_trigger", rt_keys) != 0)
+                goto out;
             yaml_node_t *en = map_get(&doc, rt, "enabled");
             if (en && parse_bool(en, &c->analog.rt_enabled) != 0) {
                 LOG_ERR("'analog.rapid_trigger.enabled' must be a boolean");
@@ -742,33 +760,6 @@ static int load_config(const char *path, oid_config_t *c) {
                         "non-negative number");
                 goto out;
             }
-            if (map_get(&doc, rt, "deep_press_mm") ||
-                map_get(&doc, rt, "deep_release_mm"))
-                LOG_WARN("'analog.rapid_trigger.deep_press_mm' and "
-                         "'deep_release_mm' were removed and are ignored - "
-                         "while riding, the backplate itself is the switch "
-                         "and no rapid trigger runs");
-        }
-        /* The legacy pair's HID overrides. With `pairs:` they belong on
-         * each entry instead, and here they would be ambiguous. */
-        static const struct { const char *key; size_t off; } hid[] = {
-            { "hid_k1", offsetof(keypair_t, hid_k1) },
-            { "hid_k2", offsetof(keypair_t, hid_k2) },
-        };
-        for (size_t i = 0; i < sizeof(hid) / sizeof(hid[0]); i++) {
-            yaml_node_t *v = map_get(&doc, an, hid[i].key);
-            if (!v) continue;
-            if (!legacy) {
-                LOG_ERR("'analog.%s' applies to the 'keys' spelling only; "
-                        "with 'pairs', put %s on the pair", hid[i].key,
-                        hid[i].key);
-                goto out;
-            }
-            if (parse_hid(v, (int *)((char *)&c->pair[0] + hid[i].off))) {
-                LOG_ERR("'analog.%s' must be \"auto\" or a HID usage id",
-                        hid[i].key);
-                goto out;
-            }
         }
     }
 
@@ -779,6 +770,9 @@ static int load_config(const char *path, oid_config_t *c) {
             LOG_ERR("'uinput' must be a mapping");
             goto out;
         }
+        static const char *const ui_keys[] = { "name", NULL };
+        if (map_check(&doc, ui, "uinput", ui_keys) != 0)
+            goto out;
         yaml_node_t *nm = map_get(&doc, ui, "name");
         if (nm && scalar_dup(nm, &c->uinput_name) != 0) {
             LOG_ERR("'uinput.name' must be a scalar string");
@@ -1362,9 +1356,12 @@ static int analog_key_feed(analog_state_t *st, int idx, float depth_mm,
 
 /* Find the analog interface of an analog-capable keyboard. Returns the fd
  * (and fills path/fmt), or -1 when there's nothing to open. An explicit
- * path skips the vendor check but still has to look like an analog node. */
+ * path skips the vendor check but still has to look like an analog node.
+ * `quiet` silences every failure: the reconnect retry runs on each rescan
+ * of the input dir, and a board that is still unplugged is not news. */
 static int analog_open(const char *forced, char *path_out, size_t path_sz,
-                       int *fmt_out, uint16_t *vid_out, uint16_t *pid_out) {
+                       int *fmt_out, uint16_t *vid_out, uint16_t *pid_out,
+                       int quiet) {
     if (forced) {
         const char *base = strrchr(forced, '/');
         char sysdir[PATH_MAX];
@@ -1372,13 +1369,15 @@ static int analog_open(const char *forced, char *path_out, size_t path_sz,
                  base ? base + 1 : forced);
         int fmt = analog_probe_fmt(sysdir);
         if (fmt == ANALOG_FMT_NONE) {
-            LOG_ERR("%s is not an analog interface "
-                    "(no 0xFF53/0xFF54 usage page)", forced);
+            if (!quiet)
+                LOG_ERR("%s is not an analog interface "
+                        "(no 0xFF53/0xFF54 usage page)", forced);
             return -1;
         }
         int fd = open(forced, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
         if (fd < 0) {
-            LOG_ERR("open(%s): %s", forced, strerror(errno));
+            if (!quiet)
+                LOG_ERR("open(%s): %s", forced, strerror(errno));
             return -1;
         }
         analog_read_ids(sysdir, vid_out, pid_out);
@@ -1406,9 +1405,10 @@ static int analog_open(const char *forced, char *path_out, size_t path_sz,
                     snprintf(dev, sizeof(dev), "/dev/%s", ents[i]->d_name);
                     int f = open(dev, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
                     if (f < 0) {
-                        LOG_WARN("open(%s): %s - analog unavailable "
-                                 "(udev rules? see README)",
-                                 dev, strerror(errno));
+                        if (!quiet)
+                            LOG_WARN("open(%s): %s - analog unavailable "
+                                     "(udev rules? see README)",
+                                     dev, strerror(errno));
                     } else {
                         fd = f;
                         *fmt_out = fmt;
@@ -1537,9 +1537,11 @@ static const char *pair_tag(const oid_config_t *cfg, int idx) {
 
 /* Open the board and resolve the pairs it drives: every analog-mode pair, or
  * with `only` >= 0 that one pair whatever its mode (-T records one pair, and
- * passively, so its mode does not matter). */
+ * passively, so its mode does not matter). `quiet` is analog_open's: the
+ * reconnect retry stays silent until it succeeds. */
 static analog_dev_t *analog_dev_open(const oid_config_t *cfg,
-                                     const char *input_dir, int only) {
+                                     const char *input_dir, int only,
+                                     int quiet) {
     analog_dev_t *ad = calloc(1, sizeof(*ad));
     if (!ad) {
         LOG_ERR("oom");
@@ -1547,7 +1549,7 @@ static analog_dev_t *analog_dev_open(const oid_config_t *cfg,
     }
     ad->kind = EP_ANALOG;
     ad->fd   = analog_open(cfg->analog.device, ad->path, sizeof(ad->path),
-                           &ad->fmt, &ad->vid, &ad->pid);
+                           &ad->fmt, &ad->vid, &ad->pid, quiet);
     if (ad->fd < 0) {
         free(ad);
         return NULL;
@@ -1572,15 +1574,34 @@ static analog_dev_t *analog_dev_open(const oid_config_t *cfg,
         ap->usage[1] = pc->hid_k2 >= 0 ? (uint16_t)pc->hid_k2
                                        : usage_of_key[pc->k2];
         if (!ap->usage[0] || !ap->usage[1]) {
-            LOG_ERR("%scould not resolve k1/k2 to HID usage ids - run with "
-                    "-A to find them, then set hid_k1 / hid_k2",
-                    pair_tag(cfg, i));
+            if (!quiet)
+                LOG_ERR("%scould not resolve k1/k2 to HID usage ids - run "
+                        "with -A to find them, then set hid_k1 / hid_k2",
+                        pair_tag(cfg, i));
             close(ad->fd);
             free(ad);
             return NULL;
         }
         ad->n_pairs++;
     }
+
+    /* One usage, one machine. pairs_check refused colliding overrides; this
+     * catches the rest - an override landing on a key another pair resolved
+     * from the keymap - which only exists once the keymap has been read. */
+    for (int a = 0; a < ad->n_pairs * 2; a++)
+        for (int b = a + 1; b < ad->n_pairs * 2; b++) {
+            const analog_pair_t *pa = &ad->pair[a / 2], *pb = &ad->pair[b / 2];
+            if (pa->usage[a % 2] != pb->usage[b % 2])
+                continue;
+            if (!quiet)
+                LOG_ERR("pair %d k%d and pair %d k%d both read hid 0x%02x: one "
+                        "physical key would drive two machines",
+                        pa->idx, a % 2 + 1, pb->idx, b % 2 + 1,
+                        pa->usage[a % 2]);
+            close(ad->fd);
+            free(ad);
+            return NULL;
+        }
 
     g_analog_vid = ad->vid;
     g_analog_pid = ad->pid;
@@ -1659,7 +1680,7 @@ static void analog_dev_close(analog_dev_t *ad) {
  * it a new value here rather than reusing this one. */
 static int analog_trace(const oid_config_t *cfg, const char *config_path,
                         const char *input_dir) {
-    analog_dev_t *ad = analog_dev_open(cfg, input_dir, cfg_trace_pair(cfg));
+    analog_dev_t *ad = analog_dev_open(cfg, input_dir, cfg_trace_pair(cfg), 0);
     if (!ad)
         return EXIT_FAILURE;
     const analog_pair_t *tp = &ad->pair[0];
@@ -1750,7 +1771,7 @@ static int analog_monitor(const char *forced, const char *input_dir,
     int      fmt = ANALOG_FMT_NONE;
     uint16_t vid = 0, pid = 0;
 
-    int fd = analog_open(forced, path, sizeof(path), &fmt, &vid, &pid);
+    int fd = analog_open(forced, path, sizeof(path), &fmt, &vid, &pid, 0);
     if (fd < 0) {
         LOG_ERR("no analog interface found%s",
                 forced ? "" : " (is an analog keyboard connected?)");
@@ -2516,8 +2537,8 @@ static void release_stuck(socd_state_t *in, const keypair_t *cfg) {
  *
  * Nothing watches /sys/class/hidraw, so the evdev node coming back is the
  * signal that the board is back; the analog node is retried alongside it.
- * A failed retry is quiet (analog_open only complains about permissions,
- * not absence), so this can run on every reconcile pass.
+ * A failed retry is quiet (analog_dev_open's `quiet`), so this can run on
+ * every reconcile pass; startup already said why the board was missing.
  *
  * The re-marking at the end is the part that is easy to miss. Devices that
  * survived the outage had in->analog cleared when the board went away, and
@@ -2530,7 +2551,7 @@ static void analog_reconcile(analog_dev_t **ad, analog_dev_t **adp,
     if (!cfg_any_analog(cfg) || *ad || devs->n == 0)
         return;
 
-    analog_dev_t *n = analog_dev_open(cfg, input_dir, -1);
+    analog_dev_t *n = analog_dev_open(cfg, input_dir, -1, 1);
     if (!n)
         return;
 
@@ -2897,7 +2918,7 @@ main(int argc, char **argv) {
      * grabbed keyboards already know their k1/k2 are analog-driven. */
     analog_dev_t *ad = NULL;
     if (cfg_any_analog(&cfg)) {
-        ad = analog_dev_open(&cfg, input_dir, -1);
+        ad = analog_dev_open(&cfg, input_dir, -1, 0);
         if (!ad)
             LOG_WARN("Analog input unavailable - falling back to the "
                      "digital reverting toggle");

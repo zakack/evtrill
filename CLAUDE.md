@@ -58,13 +58,16 @@ Without `-c`, the daemon looks for
 falls back to the installed default (`/usr/share/doubletap/config.yaml`;
 CMake bakes the real prefix in via the `DEF_CONFIG` compile definition). See `config.yaml` for the schema: `devices` (optional list of
 `/dev/input/by-id/*` paths; omitted or `auto` means auto-discovery), `socd`
-(`toggle` default, `on` as a synonym, `snappy`, `analog`, or `off`), `keys`
-(k1/k2 physical -> v1/v2 virtual, symbolic `KEY_*` names or numeric codes)
-or `pairs` (a list of those, each with optional `socd` and `hid_k1`/`hid_k2`
-— see "Pairs" below),
-`uinput` (virtual device name), `analog` (analog-mode thresholds; see
-below). Unknown keys are ignored, so a config that still carries an `audio:`
-section from before the excision loads without complaint. After
+(`toggle` default for every pair, `on` as a synonym, `snappy`, `analog`, or
+`off`), `pairs` (REQUIRED, 1-8 entries of k1/k2 physical -> v1/v2 virtual,
+symbolic `KEY_*` names or numeric codes, each with optional `socd` and
+`hid_k1`/`hid_k2` — see "Pairs" below), `uinput` (virtual device name),
+`analog` (analog-mode thresholds; see below). THE SCHEMA IS CLOSED:
+`map_check` runs on every mapping, and an unknown key or a key given twice
+is a load error. There is no legacy spelling (`keys:`, `analog.hid_k1`,
+`mode`) and no removed-key warning; those are just unknown keys now. Adding
+a config field means adding it to that mapping's allow-list as well as
+parsing it, or every config that uses it is refused. After
 editing config, restart via
 `systemctl --user restart doubletap`. The `-i DIR` flag overrides the
 scanned/watched device directory (default `/dev/input`) — mainly for
@@ -454,11 +457,13 @@ down in reverse order.
   pairs exist. If a change wants one pair to look at another, that is a
   smell: pairs are independent by definition.
 - A ONE-PAIR CONFIG MUST BE EVENT-FOR-EVENT IDENTICAL to the pre-pairs
-  build. `keys:` (and top-level `socd`, `analog.hid_k1`/`hid_k2`) parse into
-  pair 0 exactly as before; that is what keeps the corpus and every recorded
-  trace meaningful. Checked when the branch was cut: `replay -e` identical to
-  `experiment/no-audio` on all 56 analysis traces and the corpus, under the
-  default, `-a deadline`, `-a report` and `-c` (252/252).
+  build; that is what keeps the corpus and every recorded trace meaningful.
+  The spelling changed (`keys:` is gone; one pair is a one-entry `pairs:`)
+  but the machine did not. `replay`'s as-played path never reads a config
+  (`config_init` is still a one-pair Z/X -> F13/F14 default for the tools),
+  and with `-c` a one-entry `pairs:` copy of the old config replays
+  identically to `experiment/no-audio`: 264/264 over the analysis traces and
+  the corpus, under the default, `-a deadline`, `-a report` and `-c`.
 - `analog_dev_t` is the BOARD (fd, format, ids) plus `analog_pair_t pair[]`,
   one per analog-mode pair; `analog_pair_t` holds everything the latch
   functions touch, plus `idx` into `cfg->pair[]`. A memset pair is pair 0,
@@ -470,9 +475,15 @@ down in reverse order.
 - The analog THRESHOLDS are shared — they describe the board — and the HID
   overrides are per pair.
 - `pairs_check` refuses a physical or virtual key in two pairs (cross-talk:
-  two machines on one key, or one pair releasing what another holds) and
-  k1 == k2 / v1 == v2 inside one. A pair's virtual MAY be another pair's
-  physical key; the output never comes back in.
+  two machines on one key, or one pair releasing what another holds),
+  k1 == k2 / v1 == v2 inside one, and one `hid_k*` override in two places.
+  A collision between an override and a keymap-derived usage only exists
+  once the board is open, so `analog_dev_open` checks every resolved usage
+  pairwise as well. A pair's virtual MAY be another pair's physical key; the
+  output never comes back in.
+- The reconnect retry (`analog_reconcile`) opens the board with `quiet` set,
+  since it runs on every rescan of the input dir and a board that is still
+  unplugged is not news; startup opens it loud.
 - KNOWN, by construction rather than by pairs: on an analog pair with no
   debounce, both keys landing on the floor in ONE report arm the latch
   before either press edge is routed, so the reconciliation presses one key
@@ -482,7 +493,9 @@ down in reverse order.
   case W pins both.
 - Coverage: `regimetest` W (two analog pairs through `analog_drain`, the
   shared timer, the big note), X (two digital pairs through `process_event`,
-  the mixed board, `release_stuck`), Y (the config parser).
+  the mixed board, `release_stuck`), Y (the config parser: the closed schema,
+duplicates, and every cross-pair refusal, each asserted on the message it
+logs so a case cannot pass by failing for some other reason).
 
 ## What the audio excision took with it
 
