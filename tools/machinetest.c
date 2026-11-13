@@ -1,13 +1,13 @@
 #define _GNU_SOURCE
 /*
- * regimetest - assertions over the latch, the state machine and the config.
+ * machinetest - assertions over the latch, the state machine and the config.
  *
  * Includes evtrill.c and stubs only the uinput writes, so it exercises
  * the daemon's own state machine rather than a copy. Depths are fed one
  * sample at a time exactly as analog_drain feeds them.
  *
- *   build:  cmake --build build --target regimetest
- *   run:    ./build/regimetest
+ *   build:  cmake --build build --target machinetest
+ *   run:    ./build/machinetest
  */
 #include <libevdev/libevdev.h>
 #include <libevdev/libevdev-uinput.h>
@@ -21,7 +21,7 @@ static void test_emit(unsigned type, unsigned code, int value);
 
 /* The codes the log names v1..v4: pair 0's keys, then pair 1's. A pair's
  * keys are re-emitted under their own codes, so these are the keys each case
- * configures - case X swaps in its own and puts these back. */
+ * configures - case U swaps in its own and puts these back. */
 #define VCODES_DEFAULT { KEY_Z, KEY_X, KEY_A, KEY_S }
 static int vcode[4] = VCODES_DEFAULT;
 
@@ -32,16 +32,16 @@ static int  fails;
  * not change it are dropped there and never reach the game, so the harness
  * drops them too: every assertion below is about what a player actually
  * gets, not about what the daemon happened to write. */
-static int vstate[4];
+static int held_out[4];
 
-/* Counted here rather than by sampling vstate between reports: a handover
+/* Counted here rather than by sampling held_out between reports: a handover
  * onto an already-down key cycles it (release then press) WITHIN one report,
  * so its rising edge is invisible to anything that only looks at the state
  * afterwards. That is the note case H is about, so the counter has to see
  * every transition as it is written. */
-static unsigned vpresses;
+static unsigned notes_out;
 
-static unsigned vrepeats;
+static unsigned repeats_out;
 
 static void test_emit(unsigned type, unsigned code, int value) {
     if (type != EV_KEY) return;                    /* ignore SYN */
@@ -54,14 +54,15 @@ static void test_emit(unsigned type, unsigned code, int value) {
      * userspace and leaves the key down. Counting it separately keeps it out
      * of the press/release log while still letting a test assert it was
      * forwarded at all, which is the whole point while independent. */
-    if (value == 2) { vrepeats++; return; }
-    if (vstate[k] == value) return;                /* no-change: dropped */
-    vstate[k] = value;
-    if (value) vpresses++;
+    if (value == 2) { repeats_out++; return; }
+    if (held_out[k] == value) return;                /* no-change: dropped */
+    held_out[k] = value;
+    if (value) notes_out++;
     size_t n = strlen(log_buf);
+    /* Logged by the key's own name without its prefix: KEY_Z -> "Z". */
+    const char *nm = libevdev_event_code_get_name(EV_KEY, code);
     snprintf(log_buf + n, sizeof log_buf - n, "%s%s%c",
-             n ? " " : "", (const char *[]){ "v1", "v2", "v3", "v4" }[k],
-             value ? '+' : '-');
+             n ? " " : "", nm ? nm + 4 : "?", value ? '+' : '-');
 }
 
 static void reset_log(void) { log_buf[0] = '\0'; }
@@ -85,7 +86,7 @@ static void expect_int(const char *what, int got, int want) {
 }
 
 static oid_config_t cfg;
-static analog_pair_t ad;   /* pair 0, the one every case before W drives */
+static analog_pair_t ad;   /* pair 0, the one every case before T drives */
 
 /* One analog report, exactly as analog_drain processes it. */
 static void sample(float d0, float d1) {
@@ -94,7 +95,7 @@ static void sample(float d0, float d1) {
     analog_report(&ad, &cfg, d, 0);
 }
 
-/* One analog report at a given time, for the latch debounce (case S).
+/* One analog report at a given time, for the latch debounce (case Q).
  * Every other case passes 0 and runs with the debounce off, which is what
  * keeps them the instantaneous test they were written against. */
 static void sample_at(double ms, float d0, float d1) {
@@ -111,7 +112,7 @@ static void sample_at(double ms, float d0, float d1) {
  * analog_drain - the read, the decode, and the depth rebuild that feeds all
  * three - as the one link in the analog chain nothing exercises, which is
  * exactly where a daemon that disagrees with replay would have to differ.
- * Case K closes that hole by running one gesture down both paths and
+ * Case M closes that hole by running one gesture down both paths and
  * demanding the same output.
  *
  * A v2 report is 16 four-byte slots, [pad, key, packed, value], with the
@@ -142,13 +143,13 @@ static void encode_v2(unsigned char *b, const uint16_t *usage,
 
 static void fresh(void) {
     memset(&ad, 0, sizeof ad);
-    memset(vstate, 0, sizeof vstate);
-    vpresses  = 0;
+    memset(held_out, 0, sizeof held_out);
+    notes_out  = 0;
     reset_log();
 }
 
 /* ---------------------------------------------------------------------- *
- * The state machine on its own (cases M and Q).
+ * The state machine on its own (cases O and P).
  *
  * Everything above reaches machine_apply through the analog front-end, which
  * only ever runs it independent or as the trill and never sends autorepeat.
@@ -164,9 +165,9 @@ static void dfresh(int mode) {
     dcfg.pair[0].mode = mode;
     dcfg.pair[0].k1   = KEY_Z;
     dcfg.pair[0].k2   = KEY_X;
-    memset(vstate, 0, sizeof vstate);
-    vpresses  = 0;
-    vrepeats  = 0;
+    memset(held_out, 0, sizeof held_out);
+    notes_out  = 0;
+    repeats_out  = 0;
     reset_log();
 }
 
@@ -209,19 +210,19 @@ int main(void) {
      * them is about behaving correctly once a rock has actually started.
      * ------------------------------------------------------------------ */
 
-    puts("A. alt-tapping never arms it - taps clear of each other");
+    puts("A. alt-tapping never arms it - strokes clear of each other");
     fresh();
     sample(4.00f, 0.00f);
-    expect_log("k1 taps", "v1+");
+    expect_log("k1 taps", "Z+");
     sample(0.00f, 0.00f);
-    expect_log("k1 leaves", "v1-");
+    expect_log("k1 leaves", "Z-");
     sample(0.00f, 4.00f);
-    expect_log("k2 taps", "v2+");
+    expect_log("k2 taps", "X+");
     sample(0.00f, 0.00f);
-    expect_log("k2 leaves", "v2-");
+    expect_log("k2 leaves", "X-");
     expect_int("  never armed", ad.armed, 0);
 
-    puts("B. alt-tapping never arms it - taps OVERLAPPING (the headline)");
+    puts("B. alt-tapping never arms it - strokes OVERLAPPING (the headline)");
     /* This is the shape that makes a plain trill misfire: k2 actuates
      * while k1 is still emitting-pressed, so the trill steals, and then
      * k1's release is answered by re-pressing v1 - a note nobody struck.
@@ -230,13 +231,13 @@ int main(void) {
      * just a release. */
     fresh();
     sample(4.00f, 0.00f);
-    expect_log("k1 bottoms", "v1+");
+    expect_log("k1 bottoms", "Z+");
     sample(3.85f, 1.20f);
-    expect_log("k2 actuates while k1 is still pressed", "v2+");
-    expect_int("  both keys down (independent)", vstate[0] + vstate[1], 2);
+    expect_log("k2 actuates while k1 is still pressed", "X+");
+    expect_int("  both keys down (independent)", held_out[0] + held_out[1], 2);
     expect_int("  still not armed", ad.armed, 0);
     sample(3.20f, 3.85f);
-    expect_log("k1 lifts: a plain release, NOT a fallback", "v1-");
+    expect_log("k1 lifts: a plain release, NOT a fallback", "Z-");
     sample(0.50f, 3.85f);
     expect_log("k1 gone", "");
     expect_int("  never armed", ad.armed, 0);
@@ -244,25 +245,25 @@ int main(void) {
     puts("C. planting both keys on the backplate arms it, silently");
     fresh();
     sample(3.85f, 0.00f);
-    expect_log("k1 planted", "v1+");
+    expect_log("k1 planted", "Z+");
     sample(3.85f, 2.00f);
-    expect_log("k2 pressed but not yet down", "v2+");
+    expect_log("k2 pressed but not yet down", "X+");
     sample(3.85f, 3.85f);
-    expect_log("k2 reaches the backplate: arms, v1 steps aside", "v1-");
+    expect_log("k2 reaches the backplate: arms, v1 steps aside", "Z-");
     expect_int("  armed", ad.armed, 1);
-    expect_int("  exactly one key held", vstate[0] + vstate[1], 1);
+    expect_int("  exactly one key held", held_out[0] + held_out[1], 1);
 
     puts("D. while armed, the backplate IS the switch - leaving it is a note");
     /* No rapid trigger runs here and no reversal distance is consulted: the
      * only line that means anything while armed is the backplate. */
     sample(3.85f, 3.60f);
-    expect_log("k2 lifts off the backplate: one note, onto v1", "v2- v1+");
+    expect_log("k2 lifts off the backplate: one note, onto v1", "X- Z+");
 
     puts("E. rocking: one note per crossing, alternating");
     sample(3.85f, 3.85f);
-    expect_log("k2 returns to the backplate", "v1- v2+");
+    expect_log("k2 returns to the backplate", "Z- X+");
     sample(3.60f, 3.85f);
-    expect_log("k1 lifts", "v2- v1+");
+    expect_log("k1 lifts", "X- Z+");
 
     puts("F. a finger lifting CLEAR does not disarm - the other is still planted");
     /* The regression this rule exists for, from
@@ -274,7 +275,7 @@ int main(void) {
     sample(0.90f, 3.85f);
     expect_log("k1 past actuation - the old rule disarmed here", "");
     expect_int("  still armed: k2 never left the backplate", ad.armed, 1);
-    expect_int("  and its key is still held", vstate[0], 1);
+    expect_int("  and its key is still held", held_out[0], 1);
     sample(0.00f, 3.85f);
     expect_log("k1 lifted clear off the switch entirely", "");
     expect_int("  still armed", ad.armed, 1);
@@ -285,13 +286,13 @@ int main(void) {
     sample(3.70f, 3.85f);
     expect_log("still short of the backplate: still nothing", "");
     sample(3.85f, 3.85f);
-    expect_log("reaches the backplate - the note lands there", "v1- v2+");
+    expect_log("reaches the backplate - the note lands there", "Z- X+");
 
     puts("H. disarms only when BOTH are off the backplate, and releases only");
     sample(3.60f, 3.60f);
-    expect_log("both leave the backplate", "v2-");
+    expect_log("both leave the backplate", "X-");
     expect_int("  disarmed", ad.armed, 0);
-    expect_int("  nothing left held", vstate[0] + vstate[1], 0);
+    expect_int("  nothing left held", held_out[0] + held_out[1], 0);
     /* Both keys are now PARKED: live cleared, rt_extreme still at 3.60. The
      * independent rules judge against actuation_mm (1.00) from here, so a key
      * sitting this deep is exactly where a broken handoff shows up - clear
@@ -301,9 +302,9 @@ int main(void) {
     sample(3.60f, 3.60f);
     expect_log("held well down after the disarm: no fresh actuation", "");
     sample(3.85f, 3.60f);
-    expect_log("k1 bottoms out again: recovers on a real stroke", "v1+");
+    expect_log("k1 bottoms out again: recovers on a real stroke", "Z+");
 
-    puts("H2. plant, plant, rock: two strokes, three notes");
+    puts("I. plant, plant, rock: two strokes, three notes");
     /* The count tests/rock_triple_2strokes_3notes.csv is named for. */
     fresh();
     {
@@ -316,40 +317,40 @@ int main(void) {
         for (size_t i = 0; i < sizeof rock / sizeof rock[0]; i++)
             sample(rock[i][0], rock[i][1]);
         expect_int("three notes from two strokes",
-                   (int)vpresses, 3);
+                   (int)notes_out, 3);
     }
 
-    puts("H3. a slider held through a full lift, ending when both leave");
+    puts("J. a slider held through a full lift, ending when both leave");
     /* circle, circle, slider, circle. The hold has to survive one finger
      * coming clear off the switch, end when the planted finger lifts, and
      * NOT emit a phantom press for the finger that is on its way up. */
     fresh();
     sample(3.85f, 0.00f);
-    expect_log("circle 1", "v1+");
+    expect_log("circle 1", "Z+");
     sample(3.85f, 2.00f);
-    expect_log("circle 2", "v2+");
+    expect_log("circle 2", "X+");
     sample(3.85f, 3.85f);
-    expect_log("both plant: arms", "v1-");
+    expect_log("both plant: arms", "Z-");
     sample(3.60f, 3.85f);
-    expect_log("k1 leaves the backplate: the slider's note", "v2- v1+");
+    expect_log("k1 leaves the backplate: the slider's note", "X- Z+");
     sample(0.00f, 3.85f);
     expect_log("k1 lifts clear - the hold must survive", "");
-    expect_int("  v1 still holding the slider", vstate[0], 1);
+    expect_int("  v1 still holding the slider", held_out[0], 1);
     sample(0.00f, 3.60f);
-    expect_log("k2 lifts at the end of the track: slider ends", "v1-");
+    expect_log("k2 lifts at the end of the track: slider ends", "Z-");
     expect_int("  disarmed", ad.armed, 0);
     sample(1.50f, 0.00f);
-    expect_log("the final circle, tapped at actuation", "v1+");
+    expect_log("the final circle, tapped at actuation", "Z+");
 
-    puts("I. a hard tap short of the backplate never arms it");
+    puts("K. a hard stroke short of the backplate never arms it");
     fresh();
     sample(3.50f, 0.00f);
-    expect_log("k1 pressed hard, 87.5% of travel", "v1+");
+    expect_log("k1 pressed hard, 87.5% of travel", "Z+");
     sample(3.50f, 3.50f);
-    expect_log("k2 too - still short of 3.80", "v2+");
+    expect_log("k2 too - still short of 3.80", "X+");
     expect_int("  not armed", ad.armed, 0);
 
-    puts("J. while armed, depth short of the backplate never makes a note");
+    puts("L. while armed, depth short of the backplate never makes a note");
     /* What the old two-profile rule was protecting, now structural. An
      * earlier design ran a second rapid-trigger profile while armed and
      * picked between the two by the latch; a rock that overshot re-pressed
@@ -359,22 +360,22 @@ int main(void) {
      * nothing left to select between. */
     fresh();
     sample(3.85f, 0.00f);
-    expect_log("k1 planted", "v1+");
+    expect_log("k1 planted", "Z+");
     sample(3.85f, 2.00f);
-    expect_log("k2 pressed", "v2+");
+    expect_log("k2 pressed", "X+");
     sample(3.85f, 3.85f);
-    expect_log("arms", "v1-");
+    expect_log("arms", "Z-");
     sample(3.85f, 3.60f);
-    expect_log("k2 leaves the backplate: note", "v2- v1+");
+    expect_log("k2 leaves the backplate: note", "X- Z+");
     sample(3.85f, 2.00f);
     expect_log("k2 travels far further up: no second note", "");
     sample(3.85f, 3.70f);
     expect_log("and back down, still short of the backplate: nothing", "");
     sample(3.85f, 3.85f);
     expect_log("reaches the backplate - the note lands there, not before",
-               "v1- v2+");
+               "Z- X+");
 
-    puts("K. analog_drain agrees with the direct calls, report for report");
+    puts("M. analog_drain agrees with the direct calls, report for report");
     {
         /* One gesture, two paths: the direct calls every other case (and
          * replay) makes, then the same depths encoded as hardware reports
@@ -418,7 +419,7 @@ int main(void) {
             dd.pair[0].usage[1] = 0x1b;    /* KEY_X */
             snprintf(dd.path, sizeof dd.path, "pipe");
             fcntl(fd[0], F_SETFL, O_NONBLOCK);
-            vstate[0] = vstate[1] = 0;
+            held_out[0] = held_out[1] = 0;
 
             for (size_t i = 0; i < nstep; i++) {
                 unsigned char rep[ANALOG_V2_REPORT];
@@ -460,7 +461,7 @@ int main(void) {
         }
     }
 
-    puts("L. the key that plants SECOND keeps its key down - the newest stroke wins");
+    puts("N. the key that plants SECOND keeps its key down - the newest stroke wins");
     /* Arming has to drop one of two held keys, and it keeps the most recently
      * pressed one. Not cosmetic: the second key presses at actuation_mm and
      * the latch arms when it reaches the BACKPLATE, so only the travel
@@ -476,83 +477,83 @@ int main(void) {
      * leads a burst, so it must stay deterministic. */
     fresh();
     sample(3.85f, 0.00f);
-    expect_log("k1 plants first", "v1+");
+    expect_log("k1 plants first", "Z+");
     sample(3.85f, 2.00f);
-    expect_log("k2 pressed second", "v2+");
+    expect_log("k2 pressed second", "X+");
     sample(3.85f, 3.85f);
-    expect_log("arms: the OLDER key steps aside", "v1-");
-    expect_int("  the newer one keeps it", vstate[1], 1);
+    expect_log("arms: the OLDER key steps aside", "Z-");
+    expect_int("  the newer one keeps it", held_out[1], 1);
 
     /* Mirrored. Nothing privileges k1 over k2 anywhere in this path - the
      * rule is "planted second", not "k2". */
     fresh();
     sample(0.00f, 3.85f);
-    expect_log("k2 plants first", "v2+");
+    expect_log("k2 plants first", "X+");
     sample(2.00f, 3.85f);
-    expect_log("k1 pressed second", "v1+");
+    expect_log("k1 pressed second", "Z+");
     sample(3.85f, 3.85f);
-    expect_log("arms: again the older one steps aside", "v2-");
-    expect_int("  and again the newer keeps it", vstate[0], 1);
+    expect_log("arms: again the older one steps aside", "X-");
+    expect_int("  and again the newer keeps it", held_out[0], 1);
 
-    puts("M. the digital core: trill and last on k1/k2");
+    puts("O. the digital core: trill and last on k1/k2");
     dfresh(MODE_TRILL);
     dtap(0);
-    expect_log("k1 tapped alone", "v1+ v1-");
+    expect_log("k1 tapped alone", "Z+ Z-");
     dtap(0);
-    expect_log("k1 again - same key", "v1+ v1-");
+    expect_log("k1 again - same key", "Z+ Z-");
     dtap(1);
-    expect_log("k2 tapped alone", "v2+ v2-");
+    expect_log("k2 tapped alone", "X+ X-");
 
     dfresh(MODE_TRILL);
     dtap(1);
-    expect_log("k2 pressed FIRST emits v2", "v2+ v2-");
+    expect_log("k2 pressed FIRST emits v2", "X+ X-");
 
     dfresh(MODE_TRILL);
-    dkey(0, 1); expect_log("k1 down", "v1+");
-    dkey(1, 1); expect_log("k2 down: the trill steals", "v1- v2+");
-    dkey(0, 0); expect_log("k1 up: the trill falls back", "v2- v1+");
-    dkey(1, 0); expect_log("k2 up: last key released", "v1-");
+    dkey(0, 1); expect_log("k1 down", "Z+");
+    dkey(1, 1); expect_log("k2 down: the trill steals", "Z- X+");
+    dkey(0, 0); expect_log("k1 up: the trill falls back", "X- Z+");
+    dkey(1, 0); expect_log("k2 up: last key released", "Z-");
 
     /* last has no coverage anywhere else, so pin the one branch that
      * distinguishes it: S_RELEASE reverts only for the ACTIVE key. */
     dfresh(MODE_LAST);
-    dkey(0, 1); expect_log("last: k1 down", "v1+");
-    dkey(1, 1); expect_log("  k2 down steals", "v1- v2+");
+    dkey(0, 1); expect_log("last: k1 down", "Z+");
+    dkey(1, 1); expect_log("  k2 down steals", "Z- X+");
     dkey(0, 0); expect_log("  releasing the SUPPRESSED key does nothing", "");
-    dkey(1, 0); expect_log("  releasing the active key releases", "v2-");
+    dkey(1, 0); expect_log("  releasing the active key releases", "X-");
 
     dfresh(MODE_LAST);
-    dkey(0, 1); expect_log("last: k1 down", "v1+");
-    dkey(1, 1); expect_log("  k2 down steals", "v1- v2+");
-    dkey(1, 0); expect_log("  releasing the ACTIVE key reverts", "v2- v1+");
-    dkey(0, 0); expect_log("  last key released", "v1-");
+    dkey(0, 1); expect_log("last: k1 down", "Z+");
+    dkey(1, 1); expect_log("  k2 down steals", "Z- X+");
+    dkey(1, 0); expect_log("  releasing the ACTIVE key reverts", "X- Z+");
+    dkey(0, 0); expect_log("  last key released", "Z-");
 
-    puts("Q. autorepeat: forwarded while independent, dropped by the trill");
+    puts("P. autorepeat: forwarded while independent, dropped by the trill");
     /* independent forwards autorepeat to v1/v2 verbatim and always has. The
      * state-machine modes drop it inside machine_apply. */
     dfresh(MODE_INDEPENDENT);
-    dkey(0, 1); expect_log("k1 down", "v1+");
+    dkey(0, 1); expect_log("k1 down", "Z+");
     dkey(0, 2);
     expect_log("k1 autorepeat: not a press", "");
-    expect_int("  but it IS forwarded while independent", (int)vrepeats, 1);
+    expect_int("  but it IS forwarded while independent", (int)repeats_out, 1);
     expect_int("  and k1 is still tracked as held", ds.k1, 1);
-    dkey(0, 0); expect_log("k1 up", "v1-");
+    dkey(0, 0); expect_log("k1 up", "Z-");
 
     dfresh(MODE_TRILL);
-    dkey(0, 1); expect_log("k1 down", "v1+");
+    dkey(0, 1); expect_log("k1 down", "Z+");
     dkey(0, 2); expect_log("autorepeat is dropped by the trill", "");
-    expect_int("  not forwarded either", (int)vrepeats, 0);
+    expect_int("  not forwarded either", (int)repeats_out, 0);
     expect_int("  and k1 is still tracked as held", ds.k1, 1);
-    dkey(0, 0); expect_log("k1 up", "v1-");
+    dkey(0, 0); expect_log("k1 up", "Z-");
 
     /* independent is one-to-one: both keys down together. */
     dfresh(MODE_INDEPENDENT);
-    dkey(0, 1); expect_log("independent: k1 down", "v1+");
-    dkey(1, 1); expect_log("  k2 down - no stealing", "v2+");
-    dkey(0, 0); expect_log("  k1 up", "v1-");
-    dkey(1, 0); expect_log("  k2 up", "v2-");
+    dkey(0, 1); expect_log("independent: k1 down", "Z+");
+    dkey(1, 1); expect_log("  k2 down - no stealing", "X+");
+    dkey(0, 0); expect_log("  k1 up", "Z-");
+    dkey(1, 0); expect_log("  k2 up", "X-");
 
-    puts("S. latch_debounce_ms: both must STAY planted before it arms");
+    puts("Q. latch_debounce_ms: both must STAY planted before it arms");
     /* A 2B, or two hard alt-taps, grazing the backplate in one report are an
      * instant; a rock plants and stays. Until the debounce runs out the
      * pair is independent, so the only cost is that the trill
@@ -560,62 +561,62 @@ int main(void) {
     cfg.analog.latch_debounce_ms = 10.0f;
     fresh();
     sample_at(0.0, 3.85f, 0.00f);
-    expect_log("k1 planted", "v1+");
+    expect_log("k1 planted", "Z+");
     sample_at(1.0, 3.85f, 3.85f);
-    expect_log("k2 slams onto the backplate", "v2+");
+    expect_log("k2 slams onto the backplate", "X+");
     expect_int("  not armed on first contact", ad.armed, 0);
     sample_at(2.0, 0.00f, 0.00f);
-    expect_log("both leave: a hard double tap", "v1- v2-");
+    expect_log("both leave: a hard double tap", "Z- X-");
     expect_int("  never armed", ad.armed, 0);
 
     fresh();
     sample_at(10.0, 3.85f, 0.00f);
-    expect_log("k1 planted", "v1+");
+    expect_log("k1 planted", "Z+");
     sample_at(11.0, 3.85f, 3.85f);
-    expect_log("k2 planted", "v2+");
+    expect_log("k2 planted", "X+");
     sample_at(16.0, 3.85f, 3.85f);
     expect_int("  5ms in: still pending", ad.armed, 0);
     sample_at(17.0, 3.85f, 3.00f);
-    expect_log("k2 leaves the backplate mid-window", "v2-");
+    expect_log("k2 leaves the backplate mid-window", "X-");
     sample_at(19.0, 3.85f, 3.85f);
-    expect_log("k2 back down: window restarts", "v2+");
+    expect_log("k2 back down: window restarts", "X+");
     sample_at(28.0, 3.85f, 3.85f);
     expect_int("  9ms after the restart: still pending", ad.armed, 0);
     sample_at(29.0, 3.85f, 3.85f);
-    expect_log("10ms planted: arms, v1 steps aside", "v1-");
+    expect_log("10ms planted: arms, v1 steps aside", "Z-");
     expect_int("  armed", ad.armed, 1);
     sample_at(30.0, 3.85f, 3.60f);
-    expect_log("rocking works as before", "v2- v1+");
+    expect_log("rocking works as before", "X- Z+");
     sample_at(31.0, 0.00f, 0.00f);
-    expect_log("both leave: disarm is NOT debounced", "v1-");
+    expect_log("both leave: disarm is NOT debounced", "Z-");
     expect_int("  disarmed", ad.armed, 0);
     cfg.analog.latch_debounce_ms = 0.0f;
 
-    puts("T. latch_debounce_ms runs out on the CLOCK, not on the next report");
+    puts("R. latch_debounce_ms runs out on the CLOCK, not on the next report");
     /* The board reports on change: two planted, still fingers send
-     * nothing. Case S feeds a report every millisecond, which the hardware
+     * nothing. Case Q feeds a report every millisecond, which the hardware
      * does not do; here the plant goes quiet and only the timer is left to
      * end the window (issue #12). */
     cfg.analog.latch_debounce_ms = 30.0f;
     uint64_t dl = 0;
     fresh();
     sample_at(0.0, 3.85f, 0.00f);
-    expect_log("k1 planted", "v1+");
+    expect_log("k1 planted", "Z+");
     sample_at(5.0, 3.85f, 3.85f);
-    expect_log("k2 planted, then silence", "v2+");
+    expect_log("k2 planted, then silence", "X+");
     expect_int("  a deadline is running", analog_latch_deadline(&ad, &cfg, &dl), 1);
     expect_int("  at plant + 30ms", (int)(dl / 1000000ull), 35);
     reset_log();
     analog_latch_tick(&ad, &cfg, 34000000ull);
     expect_int("  timer early by 1ms: still pending", ad.armed, 0);
     analog_latch_tick(&ad, &cfg, 35000000ull);
-    expect_log("timer at the deadline arms it, v1 steps aside", "v1-");
+    expect_log("timer at the deadline arms it, v1 steps aside", "Z-");
     expect_int("  armed with no report", ad.armed, 1);
     expect_int("  and the deadline is gone", analog_latch_deadline(&ad, &cfg, &dl), 0);
     sample_at(200.0, 3.85f, 3.00f);
-    expect_log("the first lift of the rock is a note", "v2- v1+");
+    expect_log("the first lift of the rock is a note", "X- Z+");
     sample_at(210.0, 0.00f, 0.00f);
-    expect_log("both leave: disarm", "v1-");
+    expect_log("both leave: disarm", "Z-");
     expect_int("  disarmed", ad.armed, 0);
 
     /* No timer serviced before the next report - the tools, or an epoll
@@ -627,7 +628,7 @@ int main(void) {
     sample_at(0.0, 3.85f, 0.00f);
     sample_at(5.0, 3.85f, 3.85f);
     sample_at(200.0, 3.85f, 3.00f);
-    expect_log("lift after the window: arms first, then the note", "v1- v2- v1+");
+    expect_log("lift after the window: arms first, then the note", "Z- X- Z+");
     expect_int("  armed", ad.armed, 1);
 
     /* A key leaving the backplate ends the window: nothing for the timer. */
@@ -660,11 +661,11 @@ int main(void) {
     expect_int("  and never asks for a timer",
                analog_latch_deadline(&ad, &cfg, &dl), 0);
 
-    puts("U. arm_on_report: the rule from before the timer, for old traces");
+    puts("S. arm_on_report: the rule from before the timer, for old traces");
     /* replay sets this on a trace recorded by a daemon that had no debounce
      * timer, and it has to reproduce that daemon's defect exactly - the
      * point is what the virtual keyboard DID in that session, not what
-     * they should have done. These are case T's first two gestures with the
+     * they should have done. These are case R's first two gestures with the
      * opposite outcomes. */
     cfg.analog.latch_debounce_ms = 30.0f;
     fresh();
@@ -679,7 +680,7 @@ int main(void) {
     expect_int("  not armed", ad.armed, 0);
     sample_at(200.0, 3.85f, 3.00f);
     expect_log("the first lift is a plain release: the rock never armed",
-               "v2-");
+               "X-");
     expect_int("  still not armed", ad.armed, 0);
 
     /* It could still arm, but only from a report that found both keys on
@@ -691,10 +692,10 @@ int main(void) {
     sample_at(34.0, 3.85f, 3.86f);
     expect_int("a report inside the window: still pending", ad.armed, 0);
     sample_at(72.0, 3.85f, 3.87f);
-    expect_log("a report after it, both still planted: arms there", "v1-");
+    expect_log("a report after it, both still planted: arms there", "Z-");
     expect_int("  armed", ad.armed, 1);
     sample_at(200.0, 3.85f, 3.00f);
-    expect_log("  and rides as usual from then on", "v2- v1+");
+    expect_log("  and rides as usual from then on", "X- Z+");
 
     /* The flag lives on the device, and a fresh one does not have it. */
     fresh();
@@ -724,9 +725,9 @@ int main(void) {
 
         int fd[2];
         if (pipe(fd) != 0) {
-            printf("  FAIL pipe for case W: %s\n", strerror(errno));
+            printf("  FAIL pipe for case T: %s\n", strerror(errno));
             fails++;
-            goto skip_w;
+            goto skip_t;
         }
         fcntl(fd[0], F_SETFL, O_NONBLOCK);
         analog_dev_t bd;
@@ -756,26 +757,26 @@ int main(void) {
             (void)(t);                                                      \
         } while (0)
 
-        puts("W. two analog pairs on one board: two latches, never one");
-        memset(vstate, 0, sizeof vstate);
+        puts("T. two analog pairs on one board: two latches, never one");
+        memset(held_out, 0, sizeof held_out);
         BOARD(0, 3.85f, 0.00f, 0.00f, 0.00f);
-        expect_log("pair 0 k1 plants", "v1+");
+        expect_log("pair 0 k1 plants", "Z+");
         BOARD(0, 3.85f, 3.85f, 0.00f, 0.00f);
-        expect_log("pair 0 k2 slams down: arms, trills to it", "v1- v2+");
+        expect_log("pair 0 k2 slams down: arms, trills to it", "Z- X+");
         expect_int("  pair 0 armed", bd.pair[0].armed, 1);
         expect_int("  pair 1 untouched", bd.pair[1].armed, 0);
         BOARD(0, 3.85f, 3.85f, 2.00f, 0.00f);
-        expect_log("pair 1 taps while pair 0 rides", "v3+");
+        expect_log("pair 1 taps while pair 0 rides", "A+");
         BOARD(0, 3.85f, 3.85f, 0.00f, 0.00f);
-        expect_log("  and lifts: a plain release", "v3-");
+        expect_log("  and lifts: a plain release", "A-");
         BOARD(0, 3.85f, 3.85f, 3.20f, 3.85f);
         expect_log("pair 1 overlaps short of the backplate: independent",
-                   "v3+ v4+");
+                   "A+ S+");
         expect_int("  pair 1 still not armed", bd.pair[1].armed, 0);
         BOARD(0, 3.85f, 3.60f, 3.20f, 3.85f);
-        expect_log("pair 0 rocks under it: one note, pair 0 only", "v2- v1+");
+        expect_log("pair 0 rocks under it: one note, pair 0 only", "X- Z+");
         BOARD(0, 3.85f, 3.60f, 0.00f, 0.00f);
-        expect_log("pair 1 releases both", "v3- v4-");
+        expect_log("pair 1 releases both", "A- S-");
 
         /* A 2B (taiko's big note): both keys of one colour slammed onto the backplate in
          * ONE report and released together. With no debounce it arms, and
@@ -787,14 +788,14 @@ int main(void) {
          * debounce; the next block is the same strike with one. */
         BOARD(0, 3.85f, 3.60f, 3.85f, 3.85f);
         expect_log("big note, no debounce: arms, one press is zero-length",
-                   "v4+ v3+ v3-");
+                   "S+ A+ A-");
         BOARD(0, 3.85f, 3.60f, 0.00f, 0.00f);
-        expect_log("  both lift together: one release, no phantom", "v4-");
+        expect_log("  both lift together: one release, no phantom", "S-");
         expect_int("  pair 1 disarmed", bd.pair[1].armed, 0);
         expect_int("  pair 0 never noticed", bd.pair[0].armed, 1);
 
         BOARD(0, 0.00f, 0.00f, 0.00f, 0.00f);
-        expect_log("pair 0 leaves the backplate: pair 0 disarms", "v1-");
+        expect_log("pair 0 leaves the backplate: pair 0 disarms", "Z-");
 
         /* The same big note under a debounce: the strike is an instant, so
          * the window never runs out, the pair stays independent, and
@@ -807,16 +808,16 @@ int main(void) {
             analog_report(&bd.pair[1], &pc, b1, 100000000ull);
             analog_report(&bd.pair[0], &pc, b0, 100000000ull);
             expect_log("big note, 30ms debounce: two plain presses",
-                       "v3+ v4+");
+                       "A+ S+");
             reset_log();
             analog_report(&bd.pair[1], &pc, b2, 112000000ull);
             expect_log("  released 12ms later: two plain releases",
-                       "v3- v4-");
+                       "A- S-");
             expect_int("  never armed", bd.pair[1].armed, 0);
         }
         pc.analog.latch_debounce_ms = 0.0f;
         expect_int("  nothing held anywhere",
-                   vstate[0] + vstate[1] + vstate[2] + vstate[3], 0);
+                   held_out[0] + held_out[1] + held_out[2] + held_out[3], 0);
 
         /* The shared timer: two plants pending at once, one deadline each,
          * and the timerfd follows the EARLIER. A tick arms only the pair
@@ -824,7 +825,7 @@ int main(void) {
         pc.analog.latch_debounce_ms = 30.0f;
         uint64_t wdl = 0;
         float a0[2] = { 3.85f, 3.85f }, a1[2] = { 3.85f, 3.85f };
-        memset(vstate, 0, sizeof vstate);
+        memset(held_out, 0, sizeof held_out);
         analog_report(&bd.pair[1], &pc, a1, 10000000ull);
         analog_report(&bd.pair[0], &pc, a0, 20000000ull);
         expect_int("two plants pending: one deadline",
@@ -846,9 +847,9 @@ int main(void) {
         close(fd[0]);
         close(fd[1]);
     }
-skip_w:
+skip_t:
 
-    puts("X. two digital pairs: separate machines, and a mixed board");
+    puts("U. two digital pairs: separate machines, and a mixed board");
     {
         oid_config_t pc;
         memset(&pc, 0, sizeof pc);
@@ -861,7 +862,7 @@ skip_w:
         memcpy(vcode, xcodes, sizeof vcode);
         input_dev_t in;
         memset(&in, 0, sizeof in);
-        memset(vstate, 0, sizeof vstate);
+        memset(held_out, 0, sizeof held_out);
         #define KEY(c, v) do {                                              \
             struct input_event ie = { .type = EV_KEY, .code = (c),          \
                                       .value = (v) };                       \
@@ -869,16 +870,16 @@ skip_w:
             process_event(&in, &ie, &pc);                                   \
         } while (0)
 
-        KEY(KEY_D, 1); expect_log("pair 0 k1 down", "v1+");
+        KEY(KEY_D, 1); expect_log("pair 0 k1 down", "D+");
         KEY(KEY_J, 1); expect_log("pair 1 k1 down: no stealing across pairs",
-                                  "v3+");
+                                  "J+");
         KEY(KEY_F, 1); expect_log("pair 0 k2: trills inside pair 0 only",
-                                  "v1- v2+");
-        expect_int("  pair 1's key still held", vstate[2], 1);
-        KEY(KEY_D, 0); expect_log("pair 0 k1 up: pair 0 reverts", "v2- v1+");
-        KEY(KEY_J, 0); expect_log("pair 1 k1 up: just a release", "v3-");
+                                  "D- F+");
+        expect_int("  pair 1's key still held", held_out[2], 1);
+        KEY(KEY_D, 0); expect_log("pair 0 k1 up: pair 0 falls back", "F- D+");
+        KEY(KEY_J, 0); expect_log("pair 1 k1 up: just a release", "J-");
         KEY(KEY_F, 0); KEY(KEY_K, 1);
-        expect_log("pair 1 k2 alone", "v4+");
+        expect_log("pair 1 k2 alone", "K+");
         KEY(KEY_K, 0);
         KEY(KEY_A, 1); expect_log("a key in no pair passes through", "");
 
@@ -888,29 +889,29 @@ skip_w:
         pc.pair[0].mode = MODE_ANALOG;
         memset(&in, 0, sizeof in);
         in.analog = 1;
-        memset(vstate, 0, sizeof vstate);
+        memset(held_out, 0, sizeof held_out);
         KEY(KEY_D, 1); expect_log("analog pair's digital copy: dropped", "");
         KEY(KEY_J, 1); expect_log("digital pair on the same board: driven",
-                                  "v3+");
-        KEY(KEY_K, 1); expect_log("  and trills", "v3- v4+");
+                                  "J+");
+        KEY(KEY_K, 1); expect_log("  and trills", "J- K+");
         KEY(KEY_J, 0); KEY(KEY_K, 0); KEY(KEY_D, 0);
 
         /* release_stuck on a dying device covers every pair. */
         memset(&in, 0, sizeof in);
         pc.pair[0].mode = MODE_TRILL;
-        memset(vstate, 0, sizeof vstate);
+        memset(held_out, 0, sizeof held_out);
         KEY(KEY_D, 1); KEY(KEY_K, 1);
         reset_log();
         for (int p = 0; p < pc.n_pairs; p++)
             release_stuck(&in.machine[p], &pc.pair[p]);
         expect_log("device dies holding both pairs: both released",
-                   "v1- v4-");
+                   "D- K-");
         #undef KEY
         const int dcodes[4] = VCODES_DEFAULT;
         memcpy(vcode, dcodes, sizeof vcode);
     }
 
-    puts("Y. config: a closed schema, and pairs share nothing");
+    puts("V. config: a closed schema, and pairs share nothing");
     {
         /* `msg` must appear in what a refusal logs, so a case cannot pass
          * by being refused for some unrelated reason. */
@@ -987,8 +988,8 @@ skip_w:
               "'pairs[0].keys' is required" },
         };
         #undef PAIR_FJ
-        char path[] = "/tmp/regimetest-XXXXXX";
-        char errp[] = "/tmp/regimetest-err-XXXXXX";
+        char path[] = "/tmp/machinetest-XXXXXX";
+        char errp[] = "/tmp/machinetest-err-XXXXXX";
         int  tfd = mkstemp(path);
         int  efd = mkstemp(errp);
         for (size_t i = 0; tfd >= 0 && efd >= 0 &&

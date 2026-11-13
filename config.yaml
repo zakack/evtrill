@@ -1,159 +1,111 @@
 # evtrill configuration
 #
-# The daemon grabs keyboard devices (auto-discovered, or an explicit list),
-# runs a state machine over each configured pair of keys, and re-emits
-# everything via a single uinput virtual keyboard. A pair's keys keep their
-# own codes: what the machine changes is when they go down and up. Devices are hotplug-aware either way: unplugged keyboards are
-# dropped and re-grabbed when they come back.
+# evtrill grabs your keyboard, runs each configured pair of keys through its
+# own state machine, and re-emits everything through one virtual keyboard.
+# A pair's keys keep their own codes; evtrill decides only when they go down
+# and up. Keys in no pair pass through untouched.
 #
-# The schema is closed: an unknown or repeated key anywhere is an error,
-# not something to skip, so a typo stops the daemon instead of running it
-# on defaults.
+# This is the packaged default. To change it, copy it to
+# /etc/evtrill/config.yaml, edit it there, and restart the daemon:
 #
-# Copy this file to ~/.config/evtrill/config.yaml and edit it there;
-# the daemon prefers that path over the installed copy in /usr/share.
-# After editing, restart the daemon:
-#   systemctl --user restart evtrill
+#   sudo systemctl restart evtrill
+#
+# The schema is closed: an unknown or repeated key anywhere is an error, so a
+# typo stops the daemon instead of running it on defaults.
 
-# Keyboard devices to grab. OPTIONAL. When omitted (or set to the scalar
-# "auto"), every keyboard-shaped device that has every pair's keys is grabbed
-# automatically: real keyboards only (no mice/touchpads, no other virtual
-# keyboards such as those created by keyd or evtrill itself).
-#
-# To pin specific keyboards instead, list them explicitly. Use the stable
-# /dev/input/by-id/* paths so the entries survive replug
-# (ls /dev/input/by-id/ and pick the *-event-kbd entry for your keyboard).
+# Keyboards to grab. OPTIONAL. Omitted (or "auto"), evtrill grabs every
+# keyboard that has every pair's keys, and picks up hotplugged ones. To pin
+# specific keyboards, list their stable /dev/input/by-id/*-event-kbd paths:
 #
 # devices:
 #   - /dev/input/by-id/CHANGE-ME-event-kbd
 
-# The mode, for every pair that does not set its own. OPTIONAL, default
-# trill.
-#   trill  - with both keys held, every press or release of either one is
-#            the next note, alternating: hold one key and tap the other and
-#            each tap is two notes. Built for rocking two fingers.
-#   last   - last input wins: the newer key suppresses the older, releasing
-#            the active key falls back to the one still held, and releasing
-#            the suppressed one does nothing. The behaviour sold as Razer
-#            Snap Tap or Wooting Snappy Tappy.
-#   analog - needs an analog keyboard (see `analog` below): each key acts
-#            on its own, at actuation_mm with the daemon's rapid trigger,
-#            until both are planted on the backplate; then they trill until
-#            both leave it. Falls back to trill (with a warning)
-#            if no analog device is found.
+# The mode, for every pair that does not set its own. OPTIONAL, default trill.
+#
+#   trill   With both keys held, every stroke or release of either key is the
+#           next note, alternating. Hold one key and tap the other, and each
+#           stroke is two notes. Built for rocking.
+#   last    The newest stroke wins: it suppresses the older key, releasing the
+#           active key falls back to the one still held, and releasing the
+#           suppressed one does nothing. What Razer sells as Snap Tap and
+#           Wooting as Snappy Tappy.
+#   analog  Needs an analog keyboard (see `analog` below). Each key is
+#           independent until both are planted on the backplate, then the
+#           pair trills until both leave it. Without an analog board it falls
+#           back to trill, with a warning.
 mode: trill
 
-# The key pairs. REQUIRED: there is no built-in pair. Each pair is two keys
-# and its own state machine with its own mode, so a key from one pair and a
-# key from another held together are two notes, never a trill. Up to 8.
+# The pairs. REQUIRED, up to 8. Each pair is two keys with its own state
+# machine, so keys from two different pairs held together are two notes,
+# never a trill. No key may be in two pairs.
 #
-#   keys  REQUIRED. The two keys, symbolic ("KEY_Z") or numeric (44); see
-#         /usr/include/linux/input-event-codes.h for the list.
-#   mode  OPTIONAL, defaults to the top-level `mode` above.
-#   hid   OPTIONAL, analog only: the two keys' HID usage ids, either of
-#         which may be "auto". Derived from the keyboard's own keymap unless
-#         pinned (see -A).
-#
-# No key may appear in two pairs. Keys in no pair pass through untouched.
-# In analog mode every analog pair has its own `deep` latch but shares the
-# thresholds below - they describe the board.
+#   keys  REQUIRED. The two keys, by name ("KEY_Z") or code (44); see
+#         /usr/include/linux/input-event-codes.h.
+#   mode  OPTIONAL. Overrides the top-level `mode`.
+#   hid   OPTIONAL, analog only. The two keys' HID usage ids, either of which
+#         may be "auto". Read from the keyboard's own keymap unless pinned
+#         here; `evtrill -A` shows them.
 pairs:
   - { keys: [KEY_Z, KEY_X] }
 
-# osu!taiko, dons trilling on the analog latch; kats are in no pair, so they
-# pass through untouched:
+# osu!taiko, with one analog pair per colour:
 #
+# mode: analog
 # pairs:
-#   - { keys: [KEY_F, KEY_J], mode: analog }
+#   - { keys: [KEY_D, KEY_F] }   # kats
+#   - { keys: [KEY_J, KEY_K] }   # dons
 #
-# For a big note (both keys of one colour at once) on an analog pair, set
-# a non-zero analog.latch_debounce_ms: the strike is an instant, so it
-# never arms the latch and both notes pass through as plain presses.
+# A big note is a 2B: both keys of one pair struck together. Set a non-zero
+# latch_debounce_ms so a 2B that reaches the backplate does not arm the latch.
 
-# Analog mode (mode: analog on any pair). OPTIONAL - ignored otherwise.
+# Analog mode. OPTIONAL, read only when some pair is `mode: analog`.
 #
-# Analog keyboards report how far each key is pressed, not just whether it
-# is down. That lets one session serve BOTH play patterns instead of making
-# you pick one here:
+# An analog board reports how far each key is pressed, which lets one pair
+# serve both ways of playing it:
 #
-#   alt-tapping  - alternating discrete taps between the two keys. Wants
-#                  them independent: at speed the taps overlap, and a trill
-#                  reads that overlap as a rock and re-presses a key you
-#                  never struck.
-#   rocking      - both fingers planted, rocking between the keys. Wants
-#                  `trill`, for gap-free alternation.
+#   alt-tapping  Alternating strokes, one finger each. The keys must stay
+#                independent: at speed the strokes overlap, and a trill
+#                answers an overlap with a phantom note.
+#   rocking      Both fingers planted, rocking between the keys. The pair
+#                must trill, so every lift and landing is a note.
 #
-# The switch between them is the `deep` latch:
+# The latch decides which. It ARMS on a plant, both keys on the backplate at
+# once, and DISARMS when both have left it. Alt-tapping never plants: its
+# shape is one finger leaving as the other arrives. While independent, each
+# key goes down at actuation_mm and runs a rapid trigger. While armed, the
+# backplate is the switch: a key is down while it is on the backplate and up
+# as soon as it leaves, so every note of a burst lands at the same depth.
+# Arming and disarming emit no notes of their own.
 #
-#   ARMS    when BOTH keys are on the backplate in one report -> trill
-#   DISARMS when BOTH keys are off the backplate             -> independent
+# Pick numbers against your own hands with `evtrill -A` (live depth), or record
+# with `evtrill -T > trace.csv` and check it with the `replay` tool: recorded
+# alt-tapping should arm the latch zero times.
 #
-# Planting both keys is the rock and nothing else is: alt-tapping's defining
-# shape is one finger leaving as the other arrives, so the two are never on
-# the floor together however fast you play. Until it arms, the two keys stay
-# fully independent and an incidental overlap costs nothing.
-#
-# Because the backplate is a hard physical stop, this is a trigger you can
-# aim - "plant both keys to start rocking" is something you can actually do,
-# unlike "cross some depth in the middle of travel". Where the backplate
-# starts is analog.backplate_mm, the single most important number
-# here: it defines the latch AND the rapid-trigger bottom-out line.
-#
-# Arming is silent - it emits no press, since the notes for both keys
-# already landed when they bottomed. One key held deep while the
-# other is tapped is NOT treated as anything special; the two keys' depths
-# are never compared against each other.
-#
-# While the latch is armed the backplate IS the switch: a key counts as down
-# while it is against the floor and up as soon as it leaves, and rapid trigger
-# does not run at all. That is what riding already is - you bottom out every
-# stroke - so every note in a burst lands on the same hard physical line
-# instead of at whatever depth a reversal distance happened to fall.
-#
-# It also means ONE finger lifting clear does not end the latch. In a burst a
-# finger routinely comes right off the switch while the other stays planted;
-# ending the latch there would send the next note through the tapping profile
-# at actuation_mm, landing it early. Only both fingers leaving the floor ends
-# it, and that release is silent.
-#
-# Rapid trigger (press_mm/release_mm) therefore applies to TAPPING only.
-#
-# Run `evtrill -A` to watch live travel depth and pick numbers against
-# your own hands, or `evtrill -T > s.csv` to record a session and replay
-# it offline (see the replay tool). Recording your own alt-tapping and
-# checking that `replay` reports ZERO latches is the test that matters.
-#
-# Turn OFF the keyboard's own rapid trigger and SOCD (Snappy Tappy / Rappy
-# Snappy) in its configuration tool - the daemon does both itself here, and
-# on-board versions will fight it.
+# Turn OFF the keyboard's own rapid trigger and SOCD settings (Snappy Tappy,
+# Rappy Snappy) in its configuration tool; evtrill does both, and the
+# on-board versions fight it.
 #
 # analog:
 #   device: auto          # or an explicit /dev/hidrawN
-#   travel_mm: 4.0        # full key travel (Wooting 60HE+ is 4.0)
-#   actuation_mm: 1.0     # where an independent key goes down. Not used
-#                         # while armed, where the backplate is the switch.
-#   backplate_mm: 0.2     # where the backplate starts, measured from full
-#                         # travel: 0.2 on a 4.0mm switch = 95%. Bottoming
-#                         # out always presses however small the
-#                         # down-travel, it is what arms the latch when
-#                         # both keys reach it, and while the latch is armed
-#                         # it is the ONLY threshold. Must be > 0; keep
-#                         # it under ~10% of travel, or a firm stroke can
-#                         # reach it and alt-tapping may arm the latch.
-#   latch_debounce_ms: 0  # how long BOTH keys must stay on the backplate
-#                         # before the latch arms. 0 arms on the first
-#                         # report with both planted. Raise it if hard
-#                         # alt-taps that both graze the floor arm it by
-#                         # accident; a real plant lasts far longer than
-#                         # that overlap. Until it runs out the keys stay
-#                         # independent, so the cost is only that the
-#                         # trill engages later. Disarming is never
-#                         # debounced.
-#   rapid_trigger:
+#   travel_mm: 4.0        # full key travel (a Wooting 60HE+ is 4.0)
+#   actuation_mm: 1.0     # depth at which an independent key goes down
+#   backplate_mm: 0.2     # where the backplate starts, measured up from full
+#                         # travel: 0.2 on a 4.0mm switch is 95%. Reaching it
+#                         # always presses an independent key, both keys on
+#                         # it arm the latch, and while armed it is the only
+#                         # threshold. Must be > 0. Keep it under ~10% of
+#                         # travel, or a firm stroke reaches it and
+#                         # alt-tapping can arm the latch.
+#   latch_debounce_ms: 0  # how long a plant must last before the latch arms.
+#                         # 0 arms at once. Raise it if 2Bs or hard alt-taps
+#                         # arm it by accident; a real plant lasts far longer.
+#                         # Until it runs out the keys stay independent, so
+#                         # the cost is only that the trill starts later.
+#   rapid_trigger:        # independent keys only
 #     enabled: true
-#     press_mm: 0.3       # downward reversal that re-presses  } independent
-#     release_mm: 0.3     # upward reversal that releases      } only
+#     press_mm: 0.3       # downward reversal that re-presses
+#     release_mm: 0.3     # upward reversal that releases
 
-# Identification of the virtual uinput keyboard.
+# The virtual keyboard's name.
 uinput:
   name: "evtrill virtual keyboard"

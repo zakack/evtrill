@@ -65,8 +65,8 @@ target_link_libraries(evtrill PRIVATE
 # produced a `replay` validating configs against rules the daemon no longer
 # had. A few seconds of build time is the cheaper mistake.
 #   ./build/replay TRACE.csv   replay a `evtrill -T` recording
-#   ./build/regimetest         assertions over the state machine and config
-foreach(tool replay regimetest)
+#   ./build/machinetest        assertions over the state machine and config
+foreach(tool replay machinetest)
     add_executable(${tool} tools/${tool}.c)
 
     target_compile_definitions(${tool} PRIVATE

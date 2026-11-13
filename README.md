@@ -1,416 +1,204 @@
 # evtrill
 
-A two-key trill daemon for rhythm games on Linux, turning a "rocking"
-two-finger pattern into rapid-fire, gap-free key alternation on any
-keyboard. It also does last-input-wins SOCD cleaning — the behaviour sold as
-Razer Snap Tap or Wooting Snappy Tappy.
+An SOCD cleaner for rhythm games on Linux. evtrill turns two fingers rocking
+on two keys into fast, clean alternation on any keyboard, and it also does
+last-input-wins SOCD cleaning, the behaviour sold as Razer Snap Tap and
+Wooting Snappy Tappy.
 
 ![demo](docs/demo.gif)
 
-`evtrill` exclusively grabs your keyboard(s) at the evdev level — before
-Xorg/Wayland ever see the events — runs a state machine over each configured
-pair of keys, and re-emits everything through a single virtual uinput
-keyboard. A pair's keys keep their own codes; the daemon only changes when
-they go down and up. All other keys pass through untouched.
+evtrill grabs your keyboard at the evdev level, before Xorg or Wayland see
+anything, runs each configured **pair** of keys through its own state machine,
+and re-emits everything through one virtual keyboard. A pair's keys keep their
+own codes; evtrill only decides when they go down and up. Every other key
+passes through untouched.
 
-## Features
+## Modes
 
-- **Three modes**, set per pair with `mode`:
-  - `trill` (default) — with both keys held, every press or release of
-    either one is the next note, alternating: the most recent press wins,
-    and releasing **either** key re-presses the other. Rocking your fingers
-    between the two keys produces clean, gap-free alternation.
-  - `last` — *last input wins*: the most recent press wins, but only
-    releasing the **active** key falls back to the still-held one; releasing
-    the already-suppressed key does nothing. This is what Razer sells as
-    Snap Tap and Wooting as Snappy Tappy.
-  - `analog` — independent keys and `trill` in the *same session*,
-    switching between them on how far the keys are actually pressed: plant
-    both keys on the backplate and they trill, tap and each key acts on its
-    own. Adds a software rapid trigger. Requires an analog keyboard; see
-    [Analog mode](#analog-mode).
-- **Several pairs at once** — up to 8 pairs, each its own state machine
-  with its own mode.
-- **Kernel-level grab** — devices are grabbed exclusively via
-  `EVIOCGRAB`, so the raw (uncleaned) events never leak to the compositor
-  or the game. Works identically under Xorg and Wayland.
-- **Auto-discovery + hotplug** — by default every keyboard-shaped device
-  advertising every configured key is grabbed; unplugged keyboards are dropped
-  and re-grabbed on replug (inotify-driven). You can also pin an explicit
-  device list.
-- **Multiple keyboards** — each physical keyboard gets its own independent
-  state, all funneled into one virtual output device.
-- **Low latency** — single-threaded epoll loop and best-effort `SCHED_FIFO`
-  realtime scheduling.
+Each pair runs one of three modes:
 
-The whole thing is a single-file C11 daemon (`evtrill.c`).
+- **`trill`** (default). With both keys held, every stroke or release of
+  either key is the next note, alternating. Rock two fingers between the keys
+  and every lift and landing is a note.
+- **`last`**. The newest stroke wins: it suppresses the older key, and only
+  releasing the active key falls back to the one still held. This is Snap Tap
+  and Snappy Tappy.
+- **`analog`**. For analog keyboards. The keys are independent while you
+  alt-tap and trill while you rock, switched by how far they are pressed. See
+  [Analog mode](#analog-mode).
 
-## Requirements
+Up to 8 pairs run at once, each with its own mode. In osu!taiko, for example,
+one pair for dons and one for kats: a don and a kat together are two notes,
+never a trill.
 
-- Linux with evdev + uinput (any remotely modern kernel)
-- [libevdev](https://www.freedesktop.org/wiki/Software/libevdev/)
-- [libyaml](https://pyyaml.org/wiki/LibYAML)
-- CMake ≥ 3.13, a C11 compiler, and `pkg-config` to build
-
-## Installation
+## Install
 
 ### Arch Linux
 
-Install `evtrill-git` with your AUR-helper of choice.
-
-```sh
-yay -S evtrill-git
-```
+An AUR package is coming.
 
 ### From source
 
+Needs libevdev, libyaml, CMake 3.13 or newer, a C11 compiler and `pkg-config`.
+
 ```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
 cmake --build build
 sudo cmake --install build
+sudo udevadm control --reload && sudo udevadm trigger
 ```
 
-This installs the `evtrill` binary, the default config
-(`/usr/share/evtrill/`), a systemd **user** unit, and a udev rule that
-opens `/dev/uinput` to the `input` group.
+This installs the `evtrill` binary, a default config in `/usr/share/evtrill/`,
+the `evtrill.service` system unit, and a udev rule.
 
 ## Setup
 
-`evtrill` runs as an **unprivileged user service** — not as root.
-
-1. Add yourself to the `input` group (covers read access to
-   `/dev/input/event*`; the packaged udev rule opens `/dev/uinput` to the
-   same group), then log out and back in:
+1. Copy the default config to `/etc/evtrill/` and edit it. It is commented
+   throughout; [`config.yaml`](config.yaml) is the reference.
 
    ```sh
-   sudo usermod -aG input $USER
+   sudo install -Dm644 /usr/share/evtrill/config.yaml /etc/evtrill/config.yaml
    ```
 
-2. Copy the example config and edit it to taste:
+2. Start the service:
 
    ```sh
-   mkdir -p ~/.config/evtrill
-   cp /usr/share/evtrill/config.yaml ~/.config/evtrill/
+   sudo systemctl enable --now evtrill
    ```
 
-3. Enable the service:
+After editing the config, `sudo systemctl restart evtrill`. If the daemon
+refuses the config, `journalctl -u evtrill` says why: the schema is closed, so
+a typo is an error rather than a silently ignored line.
 
-   ```sh
-   systemctl --user enable --now evtrill
-   ```
+### What the service can touch
 
-Optional: for `SCHED_FIFO` realtime scheduling, grant your user realtime
-privileges (on Arch, install `realtime-privileges` and join the `realtime`
-group). The daemon warns and falls back gracefully without it.
+evtrill runs as a throwaway system user created at start, whose only privilege
+is the `input` group. That is what lets it read keyboards; the udev rule adds
+`/dev/uinput`, to create the virtual keyboard, and read-only access to Wooting
+boards for analog mode. Systemd sets its realtime priority, and the unit
+denies it the network, capabilities, and the rest of the filesystem.
+
+You do not need to be in the `input` group yourself.
 
 ## Configuration
 
-Config is read from `~/.config/evtrill/config.yaml`
-(`$XDG_CONFIG_HOME` respected), falling back to the installed default.
-See the extensively commented [`config.yaml`](config.yaml) for the full
-schema. The short version:
-
 ```yaml
-# Omit `devices` (or set it to "auto") to grab every real keyboard that has
-# every pair's keys. To pin specific keyboards, use stable by-id paths:
-# devices:
-#   - /dev/input/by-id/usb-Your_Keyboard-event-kbd
+mode: trill                       # the default for every pair
 
-mode: trill           # default for every pair: or "last" / "analog"
-
-pairs:                # required: the two keys of each pair
-  - { keys: [KEY_Z, KEY_X] }   # KEY_* names or numeric codes
-
-uinput:
-  name: "evtrill virtual keyboard"
-
-# analog:             # only used by `mode: analog` — see below
-#   actuation_mm: 1.0
-#   rapid_trigger:
-#     bottom_out_mm: 0.2
+pairs:
+  - { keys: [KEY_Z, KEY_X] }      # osu!standard
+  - { keys: [KEY_D, KEY_F], mode: last }
 ```
 
-More than one pair of keys can run at once, each with its own state machine
-and mode (up to 8):
-
-```yaml
-pairs:                # one pair rocks on the analog latch, one trills
-  - { keys: [KEY_F, KEY_J], mode: analog }
-  - { keys: [KEY_D, KEY_K], mode: trill }
-```
-
-Pairs are fully independent: no key may be in two pairs, and keys from
-different pairs never interact. `mode` on a pair defaults to the top-level
-one.
-
-The schema is closed: an unknown or repeated key anywhere in the file is an
-error that stops the daemon, so a typo never silently runs it on defaults.
-See [`config.yaml`](config.yaml) for the details.
-
-After editing, restart the daemon:
-
-```sh
-systemctl --user restart evtrill
-```
+Keys are `KEY_*` names or numeric codes. No key may be in two pairs. By
+default evtrill grabs every keyboard that has every pair's keys, and picks up
+keyboards as they are plugged in; `devices:` pins specific ones instead.
 
 ## Analog mode
 
-Analog keyboards report *how far* each key is pressed, not just whether it
-is down. `mode: analog` uses that to run **both** play patterns in one
-session, instead of making you pick one at config time.
+An analog keyboard reports how far each key is pressed, not just whether it is
+down. That lets one pair serve both ways of playing it:
 
-The two patterns want opposite things:
-
-| pattern | what it is | wants |
+| gesture | what it is | the pair should be |
 | --- | --- | --- |
-| **alt-tapping** | alternating discrete taps between the two keys | independent keys |
-| **rocking** | both fingers planted, rocking between the keys | `trill` |
+| **alt-tapping** | alternating strokes, one finger each | independent |
+| **rocking** | both fingers planted, rocking between the keys | trilling |
 
-And each wrecks the other pattern. `trill` is wrong for alt-tapping
-because at speed the taps overlap — the second key lands before the first has
-come back up — and the trill reads that overlap as a rock:
+Each is wrong for the other. At speed, alt-tapping strokes overlap in the
+middle of travel, and a trill answers the overlap with a **phantom note**: a
+note no finger struck. Independent keys, meanwhile, give rocking nothing to
+alternate.
 
-> It answers the outgoing key's release by **re-pressing the other key**, a
-> note you never struck.
-> Every overlapped pair costs a spurious note, and the inversion it leaves
-> behind carries into everything after it.
-
-Independent keys are right for alt-tapping and useless for rocking, since
-nothing alternates.
-
-### The `deep` latch
-
-Travel depth supplies a discriminator that a fixed threshold cannot have:
+### The latch
 
 > **Planting both keys on the backplate is the rock, and nothing else is.**
 
-Alt-tapping never puts both fingers on the floor at the same instant — its
-defining shape is one finger leaving as the other arrives, however fast you
-play and however much the presses overlap in the middle of travel. Rocking,
-by contrast, *begins* by planting both; you cannot start one any other way.
+Alt-tapping never puts both keys on the backplate at once: its shape is one
+finger leaving as the other arrives, however fast you play. Rocking starts by
+planting both. So each analog pair has a **latch**: it **arms** when both keys
+reach the backplate together, and the pair trills; it **disarms** when both
+have left it, and the keys are independent again. One finger lifting clear is
+a stroke, not an exit.
 
-So: `deep` **arms** when both keys are on the backplate in one report,
-and they trill. It **disarms** when **both** of them are back off the
-backplate, and the keys are independent again. Until it
-arms, they are completely independent.
+The backplate is a hard stop, so this is a trigger you can aim: "plant both
+keys to start rocking" is something you can actually do. Where it starts is
+`analog.backplate_mm`, the most important number in the analog block.
 
-One finger lifting clear is *not* an exit. In a burst a finger routinely comes
-right off the switch while the other stays planted; ending the latch there
-would push the next note through the tapping profile at `actuation_mm` and
-land it early. Two thresholds inside one burst is a limp, and "how completely
-you lift" is exactly the kind of amplitude-driven rule this design rejects
-everywhere else.
+Arming and disarming emit no notes of their own.
 
-Because the backplate is a hard physical stop, this is a trigger you can
-*aim*: "plant both keys to start rocking" is an instruction you can
-actually follow, unlike "cross some depth in the middle of travel". The
-threshold is `rapid_trigger.bottom_out_mm` — the single most important
-number in the analog block, since it defines the backplate for both the
-latch and rapid trigger.
+### Independent and armed
 
-Note what this deliberately does **not** try to do: it never compares one
-key's depth against the other's. One key held deep while the other is
-lightly pressed or tapped is not a problem and is left entirely alone.
+| latch | a key goes down | a key comes up |
+| --- | --- | --- |
+| independent | at `actuation_mm`, then on rapid trigger | on rapid trigger |
+| armed | on reaching the backplate | on leaving the backplate |
 
-#### What arming and disarming emit
-
-Arming is **silent**. It releases one key so the trill's
-one-key-down invariant holds, and emits no press — planting
-your fingers is not a note, and the notes for both keys already landed when
-they bottomed. It leaves exactly one key down, correctly named, so
-every later crossing of the backplate is a plain handover: one beat per lift,
-whichever finger moves.
-
-Disarming is **silent too**, and that is what the "both off the floor" rule
-buys. Since nobody is still riding by the time it fires, there is no hold to
-strand and so nothing to press. An earlier rule could disarm with the other
-finger planted deep, and had to re-press to avoid stranding it — one extra
-note for one lift. That cost is gone.
-
-### Rapid trigger
-
-Rapid trigger follows the same shape as Wootility's: `press_mm` and
-`release_mm` are reversal distances, and — as with a full release always
-releasing — **bottoming out always presses**, however small the down-travel
-(`bottom_out_mm`).
-
-It is **tapping-only**, though. Which of the two rules a key runs is decided
-by whether `deep` is armed — not by any depth:
-
-| state | rule |
-| --- | --- |
-| not armed (tapping) | `actuation_mm`, plus rapid trigger on `press_mm` / `release_mm` |
-| armed (riding) | the backplate alone — down against the floor, up as soon as it leaves |
-
-**While riding, the backplate *is* the switch**, and rapid trigger does not
-run at all. That is what riding already is — you bottom out every stroke — so
-every note in a burst lands on the same hard physical line instead of at
-whatever depth a reversal distance happened to fall. No hysteresis is needed:
-a hard stop cannot be hovered on, the same property that makes the latch
-aimable. Making the backplate the only thing that re-presses is the setting
-Wootility caps at 2.5 mm and never lets you reach.
-
-Tying the rule to the gesture rather than a depth is what keeps beats even.
-An earlier version picked a profile from the anchor against a threshold, so a
-rock that overshot that line silently switched to the tapping profile and
-re-pressed part-way up instead of waiting for the backplate — the beat landed
-early on exactly the rocks that went high. Amplitude changing the rule is a
-limp, not a threshold.
-
-`actuation_mm` and the `rapid_trigger` distances therefore only ever apply to
-tapping. The `deep_press_mm` / `deep_release_mm` keys of earlier versions are
-gone; the daemon warns and ignores them if it finds them in a config.
-
-### Recording and replaying a session
-
-`-T` writes the travel of k1/k2 to stdout, one line per hardware report
-(`us,k1_mm,k2_mm`), until Ctrl-C.
-
-Like `-A` it is completely passive — it opens the keyboard's hidraw node and
-nothing else, so there is no grab, no virtual device, and nothing in the
-input path. Whoever records plays on their own setup with their own keyboard
-behaving exactly as it normally does.
-
-```sh
-./build/evtrill -T > session.csv     # play, then Ctrl-C
-./build/replay session.csv
-```
-
-`replay` runs the recording back through the daemon's own analog state
-machine — it `#include`s `evtrill.c` and stubs only the uinput writes, so
-it cannot drift from what the daemon actually does. It reports how many
-times `deep` armed, how many virtual presses were emitted, a histogram of
-how deep the keypresses actually went, and a sweep of latches against
-`bottom_out_mm` so you can see how the backplate's width changes it.
-
-The trace's header records the analog thresholds it was played under, along
-with the path of the config they came from, so `replay` with no `-c` runs it
-under those settings without reading your config at all. A trace means the
-same thing after you retune, and on someone else's machine. To try other
-thresholds on an old session, pass `-c CONFIG`: the file wins, and `replay`
-notes every setting that differs from the recording. Traces recorded before
-the thresholds were in the header still read the config as they always did.
-
-**A trace of your own alt-tapping is the acceptance test.** Record one and
-check that it reports *zero* latches:
-
-```sh
-./build/evtrill -T > alttap.csv      # alt-tap a stream at speed
-./build/replay alttap.csv               # "0 deep latches" is the answer you want
-```
-
-If it arms even once, your `bottom_out_mm` is too wide for how hard you
-bottom out — the sweep shows how the count moves with it. On synthetic
-traces the latch never arms during alternating taps at any speed down to 40
-notes/second; it starts only once you hold each key longer than the gap
-between notes, which is the point where you have stopped tapping and
-started riding. The depth
-histogram is the other half of that picture: a player who never presses
-past half travel cannot arm it at all, whatever their timing does.
+Rapid trigger works like Wootility's: `press_mm` and `release_mm` are reversal
+distances, a full release always releases, and reaching the backplate always
+presses. While armed it does not run at all: every note of a burst lands at
+the backplate.
 
 ### Picking thresholds
 
-Run the analog monitor and watch your own travel depth:
+`evtrill -A` prints each key's live depth and the peak of each stroke. It
+grabs nothing, so it runs alongside the service. It reads the board's hidraw
+node as you: Wootility's udev rules give you that access, or run it with
+`sudo`. Set `backplate_mm` so the
+backplate starts just above where your fingers rest when rocking.
+
+Then check it against your own alt-tapping: record a stream with
+`evtrill -T > alttap.csv` (play, then Ctrl-C) and replay it with the `replay`
+tool from the build directory:
 
 ```sh
-evtrill -A
+./build/replay alttap.csv
 ```
 
-It prints live depth per key and the peak depth of each press, grabs
-nothing, and creates no virtual device — safe to run alongside a live
-daemon. Set `bottom_out_mm` so the backplate starts just above where your
-fingers actually rest when riding.
+It should report the latch armed **0 times**. If it arms, `backplate_mm` is
+too wide for how hard you bottom out; the sweep at the end of the report shows
+how the count moves with it. If 2Bs (both keys struck together on purpose)
+arm it, raise `latch_debounce_ms`.
 
-It also prints each key's **HID usage id** alongside its name. The daemon
-derives those from the keyboard's own keymap, so you should not need them —
-but if a key comes out wrong you can pin them with the pair's `hid`, e.g.
-`hid: [0x09, 0x0d]`.
+`-A` also shows each key's HID usage id. evtrill reads these from the
+keyboard's own keymap, but a pair's `hid:` pins them if a key comes out wrong.
 
 ### Requirements and caveats
 
-- A Wooting keyboard (the analog interface is read directly from
-  `/dev/hidraw*`; no vendor SDK or kernel driver is involved). Other analog
-  boards are not supported yet.
-- Read access to the analog hidraw node. The `70-wooting.rules` udev rules
-  shipped with Wootility grant this via `uaccess`, which covers a graphical
-  session; outside one, add a group-based rule.
-- **Turn off the keyboard's own rapid trigger and SOCD** (Snappy Tappy /
-  Rappy Snappy) for the keys in analog pairs. The daemon does both itself, and on-board versions fight
-  it.
-- If no analog device is found, the daemon logs a warning and falls back to
-  the digital `trill` behaviour rather than failing.
-- One known residual: *while the latch is armed*, with one finger resting on
-  a bottomed key, taps on the other that never reach the floor register
-  nothing — the backplate is the only switch during a rock. It clears the
-  moment the resting finger leaves the floor, and during a real burst every
-  stroke bottoms out by definition, so it is accepted; it is untested in
-  play as of this writing.
+- **A Wooting keyboard.** evtrill reads its analog interface straight from
+  `/dev/hidraw*`, with no vendor SDK or driver. Other analog boards are not
+  supported yet.
+- **Turn off the keyboard's own rapid trigger and SOCD settings** (Snappy
+  Tappy, Rappy Snappy) for keys in analog pairs. evtrill does both, and the
+  on-board versions fight it.
+- Without an analog board, analog pairs fall back to `trill`, with a warning.
+- While armed, with one finger resting on the backplate, strokes on the other
+  key that stop short of the backplate register nothing. It clears as soon as
+  the resting finger lifts, and in a real burst every stroke reaches the
+  backplate.
 
-## Running manually
+## Running by hand
 
 ```
 usage: evtrill [-h] [-A|-T] [-c CONFIG] [-i DIR]
 
-options:
     -h          show this help and exit
     -A          analog monitor: print live key travel depth and exit
-                (for picking thresholds; grabs nothing)
     -T          trace one pair's travel as CSV on stdout until Ctrl-C
-                (the first analog pair, else the first pair)
-                (grabs nothing; replay it with the `replay` tool)
     -c CONFIG   path to YAML config
-    -i DIR      directory to scan/watch for event devices
-                (default /dev/input; mainly for testing)
+    -i DIR      directory to scan/watch for event devices (default /dev/input)
 ```
 
-Handy for trying config changes before restarting the service:
-
-```sh
-./build/evtrill -c config.yaml
-```
-
-## How it works
-
-1. **Grab** — keyboards are opened via libevdev and exclusively grabbed, so
-   nothing else on the system sees their raw events. The daemon refuses to
-   grab its own virtual output (that would be an instant feedback loop).
-2. **Filter** — a per-device, per-pair state machine tracks the pair's two
-   keys and which one is currently active. Pressing the second
-   key while the first is held releases the first and presses
-   the second ("release-then-press", always separated by `SYN_REPORT`s).
-   Releasing a key while the other is still held re-presses the other
-   (in `trill` mode; `last` only does this when the active key was
-   released). In `analog` mode the digital events for the pair's keys on
-   that keyboard are dropped and the
-   same state machine is driven instead by press/release edges synthesized
-   from travel depth, read from the keyboard's analog hidraw interface on
-   the same epoll loop.
-3. **Re-emit** — everything flows out through one uinput virtual keyboard
-   with a full keyboard-wide key set, so hotplugged keyboards with unusual
-   keys still work. All other events are mirrored verbatim.
-
-## Development
-
-Two test tools `#include evtrill.c` outright, so they exercise the
-daemon's real state machine rather than a copy that could drift. Both build
-as part of `all`, deliberately — the guarantee is worthless if the binaries
-can go stale.
-
-- `build/regimetest` — assertions over the `deep` latch and its mode
-  transitions.
-- `build/replay` — replays a `-T` trace through the analog front end, and
-  sweeps `bottom_out_mm` so you can see how the backplate's width moves the
-  latch count.
+`-A` and `-T` grab nothing. To try a config before installing it, stop the
+service and run `sudo evtrill -c myconfig.yaml`.
 
 ## Fair play
 
-evtrill rewrites your input below the game's view: what the game
-receives is not literally what your fingers did. Some games, anti-cheat
-systems, and tournament rulesets prohibit SOCD-style input handling —
-Valve banned the equivalent keyboard-firmware features (Razer Snap Tap,
-Wooting SOCD) from CS2 in 2024, and rhythm game communities have their own
-rules on input assistance. Check the rules of whatever you're playing
-before using this. You are responsible for how you use it.
+evtrill rewrites your input before the game sees it: what the game receives is
+not literally what your fingers did. Some games, anti-cheat systems and
+tournament rulesets prohibit SOCD cleaning; Valve banned the equivalent
+keyboard features (Razer Snap Tap, Wooting SOCD) from CS2 in 2024, and rhythm
+game communities have their own rules on input assistance. Check the rules of
+whatever you play. How you use it is up to you.
 
 ## License
 

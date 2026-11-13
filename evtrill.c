@@ -84,7 +84,7 @@
 static void logf_(const char *level, const char *fmt, ...)
 __attribute__((format(printf, 2, 3)));
 
-/* Set by the offline tools (replay, regimetest) while they push samples
+/* Set by the offline tools (replay, machinetest) while they push samples
  * through the state machine. They run the same code the daemon does, so the
  * daemon's own progress chatter comes out of them too - and replay's
  * bottom_out sweep runs the whole trace nine times over, which turns one
@@ -1500,7 +1500,7 @@ typedef struct {
     int            plant_pending; /* both keys are on the backplate and the
                                    * debounce is running */
     uint64_t       plant_ns;    /* report time that started the debounce.
-                                 * Not a sentinel: regimetest passes 0 on
+                                 * Not a sentinel: machinetest passes 0 on
                                  * every report, so `plant_pending` is. */
     float          plant_mm[2]; /* latch depths in the latest report while
                                  * the debounce runs - only for the ARMED
@@ -2366,7 +2366,7 @@ static void analog_machine_edge(analog_pair_t *ad, int is_k1, int value,
 }
 
 /* Turn ONE report's worth of depths into edges. Split out of
- * analog_drain so that tools/replay.c and tools/regimetest.c drive this
+ * analog_drain so that tools/replay.c and tools/machinetest.c drive this
  * exact function instead of reimplementing the ordering - the latch
  * resolution and the edge routing have to happen in this order, and a copy
  * in the tools would be free to drift from the daemon while still passing
