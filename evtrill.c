@@ -68,7 +68,11 @@
 #define DEF_K2     KEY_X
 #define DEF_NAME   "evtrill virtual keyboard"
 
-/* Installed data path; CMake overrides this to match the install prefix. */
+/* Where the config lives, and the packaged default used when it does not
+ * exist. CMake overrides both to match the install prefix. */
+#ifndef SYS_CONFIG
+#define SYS_CONFIG "/etc/evtrill/config.yaml"
+#endif
 #ifndef DEF_CONFIG
 #define DEF_CONFIG "/usr/share/evtrill/config.yaml"
 #endif
@@ -2752,32 +2756,21 @@ static void print_usage(FILE *s, const char *prog) {
         "    -i DIR      directory to scan/watch for event devices\n"
         "                (default /dev/input; mainly for testing)\n"
         "\n"
-        "Without -c, the config is looked up at\n"
-        "$XDG_CONFIG_HOME/evtrill/config.yaml (~/.config if unset),\n"
-        "falling back to %s.\n",
-        prog, DEF_CONFIG);
+        "Without -c, the config is %s, or the packaged\n"
+        "default %s if that does not exist.\n",
+        prog, SYS_CONFIG, DEF_CONFIG);
 }
 
-/* Resolve the config path when -c wasn't given: prefer the per-user XDG
- * config, fall back to the installed default. */
+/* Resolve the config path when -c wasn't given. evtrill is a system
+ * daemon, so there is one config, in /etc, and no per-user lookup: a
+ * daemon reading a home directory would be configured by whoever happened
+ * to own it. The packaged default applies only when the file does not
+ * EXIST - one that exists but cannot be read is still the config, and
+ * load_config says why it failed rather than quietly running the default. */
 static const char *default_config_path(void) {
-    static char path[4096];
-    const char *xdg = getenv("XDG_CONFIG_HOME");
-    int n;
-
-    if (xdg && *xdg) {
-        n = snprintf(path, sizeof(path), "%s/evtrill/config.yaml", xdg);
-    } else {
-        const char *home = getenv("HOME");
-        if (!home || !*home)
-            return DEF_CONFIG;
-        n = snprintf(path, sizeof(path), "%s/.config/evtrill/config.yaml",
-                     home);
-    }
-    if (n < 0 || (size_t)n >= sizeof(path))
-        return DEF_CONFIG;
-    if (access(path, R_OK) == 0)
-        return path;
+    struct stat st;
+    if (stat(SYS_CONFIG, &st) == 0 || errno != ENOENT)
+        return SYS_CONFIG;
     return DEF_CONFIG;
 }
 
@@ -2849,12 +2842,18 @@ main(int argc, char **argv) {
                  mode_name(pc->mode));
     }
 
-	/* use rt scheduler if we can */
-    struct sched_param sp = { .sched_priority = 90 };
-    if (sched_setscheduler(0, SCHED_FIFO, &sp) < 0) {
-        LOG_WARN("Failed to set SCHED_FIFO: %s. Falling back to standard scheduler.", strerror(errno));
+    /* Realtime priority. Under the packaged unit systemd has already set
+     * it (CPUSchedulingPolicy=), so the unit needs no capability for it and
+     * this only reports. Run by hand, it is still worth asking for. */
+    if (sched_getscheduler(0) == SCHED_FIFO) {
+        LOG_INFO("Running with SCHED_FIFO realtime priority");
     } else {
-        LOG_INFO("Successfully acquired SCHED_FIFO real-time priority.");
+        struct sched_param sp = { .sched_priority = 90 };
+        if (sched_setscheduler(0, SCHED_FIFO, &sp) < 0)
+            LOG_WARN("Could not set SCHED_FIFO (%s); running with the "
+                     "standard scheduler", strerror(errno));
+        else
+            LOG_INFO("Running with SCHED_FIFO realtime priority");
     }
 
     /* Single virtual keyboard. Created before any grabs: device discovery

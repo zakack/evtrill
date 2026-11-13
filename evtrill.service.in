@@ -1,5 +1,5 @@
 [Unit]
-Description=evtrill SOCD-cleaning input daemon
+Description=evtrill, a two-key SOCD cleaner for rhythm games
 Documentation=https://github.com/zakack/evtrill
 
 [Service]
@@ -8,16 +8,51 @@ ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/evtrill
 Restart=on-failure
 RestartSec=2s
 
-# This is a user unit: enable it with
-#   systemctl --user enable --now evtrill
-#
-# The daemon needs read access to /dev/input/event* and read/write access
-# to /dev/uinput. Both are covered by membership in the `input` group
-# (the packaged udev rule opens /dev/uinput to that group):
-#   sudo usermod -aG input $USER   # then log out and back in
-#
-# Config is read from ~/.config/evtrill/config.yaml, falling back to
-# @CMAKE_INSTALL_FULL_DATADIR@/evtrill/config.yaml.
+# The config is @CMAKE_INSTALL_FULL_SYSCONFDIR@/evtrill/config.yaml, or the
+# packaged default @CMAKE_INSTALL_FULL_DATADIR@/evtrill/config.yaml when that
+# does not exist. Apply an edit with `systemctl restart evtrill`.
+
+# A throwaway unprivileged user, created at start and gone at stop. Its only
+# privilege is the `input` group: reading keyboards, plus /dev/uinput and the
+# analog board's hidraw node through the packaged udev rule.
+DynamicUser=yes
+SupplementaryGroups=input
+
+# Realtime priority, set by systemd before exec, so the daemon needs no
+# capability for it.
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=90
+
+# Devices: keyboards and the analog board read-only, uinput to write to.
+DevicePolicy=closed
+DeviceAllow=char-input r
+DeviceAllow=char-hidraw r
+DeviceAllow=/dev/uinput rw
+
+# Everything else it could reach, it does not need.
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=none
+IPAddressDeny=any
+ProtectHome=yes
+ProtectSystem=strict
+ProtectProc=invisible
+ProcSubset=pid
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+UMask=0077
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target

@@ -12,12 +12,13 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBEVDEV REQUIRED libevdev)
 pkg_check_modules(LIBYAML  REQUIRED yaml-0.1)
 
-# Installation directories for the systemd user unit and udev rule. Default
-# to what the host's systemd/udev report; override with -D for packaging.
-if(NOT SYSTEMD_USER_UNIT_DIR)
-    pkg_get_variable(SYSTEMD_USER_UNIT_DIR systemd systemduserunitdir)
-    if(NOT SYSTEMD_USER_UNIT_DIR)
-        set(SYSTEMD_USER_UNIT_DIR "${CMAKE_INSTALL_LIBDIR}/systemd/user")
+# Installation directories for the systemd system unit and udev rule.
+# Default to what the host's systemd/udev report; override with -D for
+# packaging.
+if(NOT SYSTEMD_SYSTEM_UNIT_DIR)
+    pkg_get_variable(SYSTEMD_SYSTEM_UNIT_DIR systemd systemdsystemunitdir)
+    if(NOT SYSTEMD_SYSTEM_UNIT_DIR)
+        set(SYSTEMD_SYSTEM_UNIT_DIR "${CMAKE_INSTALL_LIBDIR}/systemd/system")
     endif()
 endif()
 if(NOT UDEV_RULES_DIR)
@@ -32,6 +33,7 @@ endif()
 add_executable(evtrill evtrill.c)
 
 target_compile_definitions(evtrill PRIVATE
+    SYS_CONFIG="${CMAKE_INSTALL_FULL_SYSCONFDIR}/evtrill/config.yaml"
     DEF_CONFIG="${CMAKE_INSTALL_FULL_DATADIR}/evtrill/config.yaml"
 )
 
@@ -63,11 +65,12 @@ target_link_libraries(evtrill PRIVATE
 # produced a `replay` validating configs against rules the daemon no longer
 # had. A few seconds of build time is the cheaper mistake.
 #   ./build/replay TRACE.csv   replay a `evtrill -T` recording
-#   ./build/regimetest         assertions over the regime
+#   ./build/regimetest         assertions over the state machine and config
 foreach(tool replay regimetest)
     add_executable(${tool} tools/${tool}.c)
 
     target_compile_definitions(${tool} PRIVATE
+        SYS_CONFIG="${CMAKE_INSTALL_FULL_SYSCONFDIR}/evtrill/config.yaml"
         DEF_CONFIG="${CMAKE_INSTALL_FULL_DATADIR}/evtrill/config.yaml"
     )
     target_compile_options(${tool} PRIVATE
@@ -91,6 +94,6 @@ configure_file(evtrill.service.in evtrill.service @ONLY)
 install(TARGETS evtrill RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES   config.yaml             DESTINATION ${CMAKE_INSTALL_DATADIR}/evtrill)
 install(FILES   ${CMAKE_CURRENT_BINARY_DIR}/evtrill.service
-                                        DESTINATION ${SYSTEMD_USER_UNIT_DIR})
-install(FILES   70-evtrill-uinput.rules
+                                        DESTINATION ${SYSTEMD_SYSTEM_UNIT_DIR})
+install(FILES   70-evtrill.rules
                                         DESTINATION ${UDEV_RULES_DIR})

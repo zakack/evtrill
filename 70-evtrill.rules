@@ -1,0 +1,16 @@
+# Device access for evtrill's system service, which runs as a throwaway user
+# whose only privilege is the `input` group.
+
+# /dev/uinput, to create the virtual keyboard. static_node makes the node
+# exist at boot; opening it autoloads the uinput module.
+KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"
+
+# Wooting boards' hidraw nodes, READ-ONLY, for analog mode's travel depth.
+# Read is all evtrill needs; write would let the group send the board
+# commands. Granted as an ACL entry rather than MODE/GROUP: these nodes
+# already carry ACLs (the uaccess rules Wootility and OpenRGB install), and
+# with an ACL present the mode's group bits become the ACL MASK - so a
+# MODE="0640" grants the group nothing AND masks the desktop user's write
+# access down to read. An added entry touches neither.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="31e3", RUN+="/usr/bin/setfacl -m g:input:r $env{DEVNAME}"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="03eb", ATTRS{idProduct}=="ff01|ff02", RUN+="/usr/bin/setfacl -m g:input:r $env{DEVNAME}"
