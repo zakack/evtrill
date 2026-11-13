@@ -1,0 +1,22 @@
+# The thresholds the trace corpus in this directory was validated against.
+# The traces predate the `# analog` threshold header, so `replay` cannot
+# recover these from the files themselves, and the expected results in the
+# filenames (tap_* never latch; toggle_* latch and emit more presses than
+# were played) hold only under these numbers - NOT under the defaults in
+# ../config.yaml, which assume 4.0mm switches. Check the corpus with:
+#
+#   for t in tests/*.csv; do ./build/replay -q -c tests/corpus.yaml "$t"; done
+#
+# The keys are irrelevant to replay, which reads the two traced depths.
+mode: analog
+pairs:
+  - { keys: [KEY_Z, KEY_X] }
+analog:
+  travel_mm: 3.5
+  actuation_mm: 1.20
+  latch_debounce_ms: 32
+  rapid_trigger:
+    enabled: true
+    press_mm: 0.05
+    release_mm: 0.33
+    bottom_out_mm: 0.06
