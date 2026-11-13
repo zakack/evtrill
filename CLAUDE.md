@@ -57,17 +57,26 @@ Without `-c`, the daemon looks for
 `$XDG_CONFIG_HOME/doubletap/config.yaml` (`~/.config` if unset), then
 falls back to the installed default (`/usr/share/doubletap/config.yaml`;
 CMake bakes the real prefix in via the `DEF_CONFIG` compile definition). See `config.yaml` for the schema: `devices` (optional list of
-`/dev/input/by-id/*` paths; omitted or `auto` means auto-discovery), `socd`
-(`toggle` default for every pair, `on` as a synonym, `snappy`, `analog`, or
-`off`), `pairs` (REQUIRED, 1-8 entries of k1/k2 physical -> v1/v2 virtual,
-symbolic `KEY_*` names or numeric codes, each with optional `socd` and
-`hid_k1`/`hid_k2` — see "Pairs" below), `uinput` (virtual device name),
-`analog` (analog-mode thresholds; see below). THE SCHEMA IS CLOSED:
-`map_check` runs on every mapping, and an unknown key or a key given twice
-is a load error. There is no legacy spelling (`keys:`, `analog.hid_k1`,
-`mode`) and no removed-key warning; those are just unknown keys now. Adding
-a config field means adding it to that mapping's allow-list as well as
-parsing it, or every config that uses it is refused. After
+`/dev/input/by-id/*` paths; omitted or `auto` means auto-discovery), `mode`
+(the default for every pair: `trill`, `last` or `analog`; default `trill`),
+`pairs` (REQUIRED, 1-8 entries of `{keys: [a, b], mode?, hid?: [a, b]}` —
+see "Pairs" below), `uinput` (virtual device name), `analog` (analog-mode
+thresholds; see below). THE SCHEMA IS CLOSED: `map_check` runs on every
+mapping, and an unknown key or a key given twice is a load error. There are
+no synonyms and no legacy spellings (`socd`, `keys:`, `k1`/`v1`,
+`analog.hid_k1`, `toggle`/`snappy`/`off`/`on`); those are just unknown keys
+or bad values now. Adding a config field means adding it to that mapping's
+allow-list as well as parsing it, or every config that uses it is refused.
+
+VOCABULARY, mid-migration: the config says `trill`/`last`/`analog`; the
+code still says `SOCD_TOGGLE`/`SOCD_SNAPPY`/`SOCD_ANALOG`, `socd_apply`,
+`keypair_t.socd`, and "toggle" in comments, until the rename pass.
+`SOCD_OFF` is not a config mode: it is the analog path's unarmed state, each
+key independent and one-to-one. A pair's keys are emitted under their OWN
+codes — there are no separate virtual codes (v1/v2 were removed: the
+physical keys are consumed, so v != k was only ever a key remapper, which
+the game's keybinds and keyd/kanata already are). Wherever this file says
+"virtual key" or v1/v2, read "the pair's key as emitted". After
 editing config, restart via
 `systemctl --user restart doubletap`. The `-i DIR` flag overrides the
 scanned/watched device directory (default `/dev/input`) — mainly for
@@ -449,8 +458,8 @@ down in reverse order.
 
 ## Pairs
 
-- A PAIR IS THE OLD DAEMON, WHOLE. `keypair_t` is `{k1, k2, v1, v2, socd,
-  hid_k1, hid_k2}`; everything downstream of `pair_of_key` (digital) or the
+- A PAIR IS THE OLD DAEMON, WHOLE. `keypair_t` is `{k1, k2, socd, hid_k1,
+  hid_k2}` (config: `keys`, `mode`, `hid`); everything downstream of `pair_of_key` (digital) or the
   per-pair depth rebuild in `analog_drain` (analog) is the single-pair code
   run on that pair's state. `socd_apply` takes the pair rather than the
   config, and nothing in the core, the front-end or the latch knows how many
@@ -458,12 +467,14 @@ down in reverse order.
   smell: pairs are independent by definition.
 - A ONE-PAIR CONFIG MUST BE EVENT-FOR-EVENT IDENTICAL to the pre-pairs
   build; that is what keeps the corpus and every recorded trace meaningful.
-  The spelling changed (`keys:` is gone; one pair is a one-entry `pairs:`)
-  but the machine did not. `replay`'s as-played path never reads a config
-  (`config_init` is still a one-pair Z/X -> F13/F14 default for the tools),
-  and with `-c` a one-entry `pairs:` copy of the old config replays
-  identically to `experiment/no-audio`: 264/264 over the analysis traces and
-  the corpus, under the default, `-a deadline`, `-a report` and `-c`.
+  The spelling changed (one pair is a one-entry `pairs:`) but the machine
+  did not. `replay`'s as-played path never reads a config (`config_init`
+  is a one-pair Z/X default for the tools), and with `-c` a one-entry
+  `pairs:` copy of the old config replays identically to
+  `experiment/no-audio`: 264/264 over the analysis traces and the corpus,
+  under the default, `-a deadline`, `-a report` and `-c` — with the old
+  build's F13/F14 labels normalised to Z/X, since keys now emit as
+  themselves.
 - `analog_dev_t` is the BOARD (fd, format, ids) plus `analog_pair_t pair[]`,
   one per analog-mode pair; `analog_pair_t` holds everything the latch
   functions touch, plus `idx` into `cfg->pair[]`. A memset pair is pair 0,
@@ -474,13 +485,12 @@ down in reverse order.
   has not run out ignores the tick exactly as one pair ignores an early one.
 - The analog THRESHOLDS are shared — they describe the board — and the HID
   overrides are per pair.
-- `pairs_check` refuses a physical or virtual key in two pairs (cross-talk:
-  two machines on one key, or one pair releasing what another holds),
-  k1 == k2 / v1 == v2 inside one, and one `hid_k*` override in two places.
+- `pairs_check` refuses a key in two pairs (cross-talk: two machines on one
+  key, each releasing what the other holds), both keys of a pair the same,
+  and one `hid` override in two places.
   A collision between an override and a keymap-derived usage only exists
   once the board is open, so `analog_dev_open` checks every resolved usage
-  pairwise as well. A pair's virtual MAY be another pair's physical key; the
-  output never comes back in.
+  pairwise as well.
 - The reconnect retry (`analog_reconcile`) opens the board with `quiet` set,
   since it runs on every rescan of the input dir and a board that is still
   unplugged is not news; startup opens it loud.

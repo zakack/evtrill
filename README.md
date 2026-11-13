@@ -1,42 +1,45 @@
 # doubletap
 
-A SOCD cleaner for Linux — snap tap style key
-handling as a daemon, turning a "rocking" two-finger pattern into
-rapid-fire, gap-free key alternation on any keyboard.
+A two-key trill daemon for rhythm games on Linux, turning a "rocking"
+two-finger pattern into rapid-fire, gap-free key alternation on any
+keyboard. It also does last-input-wins SOCD cleaning — the behaviour sold as
+Razer Snap Tap or Wooting Snappy Tappy.
 
 ![demo](docs/demo.gif)
 
 `doubletapd` exclusively grabs your keyboard(s) at the evdev level — before
-Xorg/Wayland ever see the events — applies a SOCD (Simultaneous Opposing
-Cardinal Directions) state machine to two configurable physical keys, and
-re-emits everything through a single virtual uinput keyboard. All other keys
-pass through untouched.
+Xorg/Wayland ever see the events — runs a state machine over each configured
+pair of keys, and re-emits everything through a single virtual uinput
+keyboard. A pair's keys keep their own codes; the daemon only changes when
+they go down and up. All other keys pass through untouched.
 
 ## Features
 
-- **Four SOCD modes**, selected by the `socd` config field:
-  - `toggle` (default; `on` is a synonym) — *reverting toggle*: when both
-    keys are held, the most recent press wins; releasing **either** key
-    re-presses the other virtual key. Rocking your fingers between the two
-    keys produces clean, gap-free alternation.
-  - `snappy` — *last input wins* ("Snappy Tappy"): the most recent press
-    wins, but only releasing the **active** key falls back to the still-held
-    one; releasing the already-suppressed key does nothing.
-  - `analog` — runs `off` and `toggle` in the *same session*, switching
-    between them on how far the keys are actually pressed: plant both keys
-    on the backplate and you get the toggle for rocking, tap and you get
-    the plain remap. Adds a software rapid trigger. Requires an analog
-    keyboard; see [Analog mode](#analog-mode).
-  - `off` — no SOCD cleaning: k1/k2 are simply remapped to v1/v2.
+- **Three modes**, set per pair with `mode`:
+  - `trill` (default) — with both keys held, every press or release of
+    either one is the next note, alternating: the most recent press wins,
+    and releasing **either** key re-presses the other. Rocking your fingers
+    between the two keys produces clean, gap-free alternation.
+  - `last` — *last input wins*: the most recent press wins, but only
+    releasing the **active** key falls back to the still-held one; releasing
+    the already-suppressed key does nothing. This is what Razer sells as
+    Snap Tap and Wooting as Snappy Tappy.
+  - `analog` — independent keys and `trill` in the *same session*,
+    switching between them on how far the keys are actually pressed: plant
+    both keys on the backplate and they trill, tap and each key acts on its
+    own. Adds a software rapid trigger. Requires an analog keyboard; see
+    [Analog mode](#analog-mode).
+- **Several pairs at once** — up to 8 pairs, each its own state machine
+  with its own mode.
 - **Kernel-level grab** — devices are grabbed exclusively via
   `EVIOCGRAB`, so the raw (uncleaned) events never leak to the compositor
   or the game. Works identically under Xorg and Wayland.
 - **Auto-discovery + hotplug** — by default every keyboard-shaped device
-  advertising both configured keys is grabbed; unplugged keyboards are dropped
+  advertising every configured key is grabbed; unplugged keyboards are dropped
   and re-grabbed on replug (inotify-driven). You can also pin an explicit
   device list.
 - **Multiple keyboards** — each physical keyboard gets its own independent
-  SOCD state, all funneled into one virtual output device.
+  state, all funneled into one virtual output device.
 - **Low latency** — single-threaded epoll loop and best-effort `SCHED_FIFO`
   realtime scheduling.
 
@@ -113,16 +116,15 @@ schema. The short version:
 # devices:
 #   - /dev/input/by-id/usb-Your_Keyboard-event-kbd
 
-socd: toggle          # default for every pair: "snappy" / "analog" / "off"
-                      # ("on" = "toggle")
+mode: trill           # default for every pair: or "last" / "analog"
 
-pairs:                # required: physical k1/k2 -> virtual v1/v2
-  - { k1: KEY_Z, k2: KEY_X, v1: KEY_Z, v2: KEY_X }   # KEY_* names or codes
+pairs:                # required: the two keys of each pair
+  - { keys: [KEY_Z, KEY_X] }   # KEY_* names or numeric codes
 
 uinput:
   name: "doubletap virtual keyboard"
 
-# analog:             # only used by `socd: analog` — see below
+# analog:             # only used by `mode: analog` — see below
 #   actuation_mm: 1.0
 #   rapid_trigger:
 #     bottom_out_mm: 0.2
@@ -132,13 +134,13 @@ More than one pair of keys can run at once, each with its own state machine
 and mode (up to 8):
 
 ```yaml
-pairs:                # osu!taiko: dons rock, kats remap
-  - { k1: KEY_F, k2: KEY_J, v1: KEY_F, v2: KEY_J, socd: analog }
-  - { k1: KEY_D, k2: KEY_K, v1: KEY_D, v2: KEY_K, socd: off }
+pairs:                # one pair rocks on the analog latch, one trills
+  - { keys: [KEY_F, KEY_J], mode: analog }
+  - { keys: [KEY_D, KEY_K], mode: trill }
 ```
 
 Pairs are fully independent: no key may be in two pairs, and keys from
-different pairs never interact. `socd` on a pair defaults to the top-level
+different pairs never interact. `mode` on a pair defaults to the top-level
 one.
 
 The schema is closed: an unknown or repeated key anywhere in the file is an
@@ -154,27 +156,27 @@ systemctl --user restart doubletap
 ## Analog mode
 
 Analog keyboards report *how far* each key is pressed, not just whether it
-is down. `socd: analog` uses that to run **both** play patterns in one
+is down. `mode: analog` uses that to run **both** play patterns in one
 session, instead of making you pick one at config time.
 
 The two patterns want opposite things:
 
 | pattern | what it is | wants |
 | --- | --- | --- |
-| **alt-tapping** | alternating discrete taps between the two keys | `off` |
-| **rocking** | both fingers planted, rocking between the keys | `toggle` |
+| **alt-tapping** | alternating discrete taps between the two keys | independent keys |
+| **rocking** | both fingers planted, rocking between the keys | `trill` |
 
-And each mode wrecks the other pattern. `toggle` is wrong for alt-tapping
+And each wrecks the other pattern. `trill` is wrong for alt-tapping
 because at speed the taps overlap — the second key lands before the first has
-come back up — and the toggle reads that overlap as a rock:
+come back up — and the trill reads that overlap as a rock:
 
-> It answers the outgoing key's release by **re-pressing its virtual key**, a
+> It answers the outgoing key's release by **re-pressing the other key**, a
 > note you never struck.
 > Every overlapped pair costs a spurious note, and the inversion it leaves
 > behind carries into everything after it.
 
-`off` is right for alt-tapping and useless for rocking, since nothing
-alternates.
+Independent keys are right for alt-tapping and useless for rocking, since
+nothing alternates.
 
 ### The `deep` latch
 
@@ -188,8 +190,8 @@ play and however much the presses overlap in the middle of travel. Rocking,
 by contrast, *begins* by planting both; you cannot start one any other way.
 
 So: `deep` **arms** when both keys are on the backplate in one report,
-and they switch to the toggle. It **disarms** when **both** of them are
-back off the backplate, and the keys switch back to the plain remap. Until it
+and they trill. It **disarms** when **both** of them are back off the
+backplate, and the keys are independent again. Until it
 arms, they are completely independent.
 
 One finger lifting clear is *not* an exit. In a burst a finger routinely comes
@@ -212,10 +214,10 @@ lightly pressed or tapped is not a problem and is left entirely alone.
 
 #### What arming and disarming emit
 
-Arming is **silent**. It releases one virtual key so the toggle's
+Arming is **silent**. It releases one key so the trill's
 one-key-down invariant holds, and emits no press — planting
 your fingers is not a note, and the notes for both keys already landed when
-they bottomed. It leaves exactly one virtual key down, correctly named, so
+they bottomed. It leaves exactly one key down, correctly named, so
 every later crossing of the backplate is a plain handover: one beat per lift,
 whichever finger moves.
 
@@ -321,8 +323,8 @@ fingers actually rest when riding.
 
 It also prints each key's **HID usage id** alongside its name. The daemon
 derives those from the keyboard's own keymap, so you should not need them —
-but if a key comes out wrong you can pin them with `hid_k1` / `hid_k2` on
-the pair.
+but if a key comes out wrong you can pin them with the pair's `hid`, e.g.
+`hid: [0x09, 0x0d]`.
 
 ### Requirements and caveats
 
@@ -333,10 +335,10 @@ the pair.
   shipped with Wootility grant this via `uaccess`, which covers a graphical
   session; outside one, add a group-based rule.
 - **Turn off the keyboard's own rapid trigger and SOCD** (Snappy Tappy /
-  Rappy Snappy). The daemon does both itself, and on-board versions fight
+  Rappy Snappy) for the keys in analog pairs. The daemon does both itself, and on-board versions fight
   it.
 - If no analog device is found, the daemon logs a warning and falls back to
-  the digital `toggle` behaviour rather than failing.
+  the digital `trill` behaviour rather than failing.
 - One known residual: *while the latch is armed*, with one finger resting on
   a bottomed key, taps on the other that never reach the floor register
   nothing — the backplate is the only switch during a rock. It clears the
@@ -353,7 +355,8 @@ options:
     -h          show this help and exit
     -A          analog monitor: print live key travel depth and exit
                 (for picking thresholds; grabs nothing)
-    -T          trace k1/k2 travel as CSV on stdout until Ctrl-C
+    -T          trace one pair's travel as CSV on stdout until Ctrl-C
+                (the first analog pair, else the first pair)
                 (grabs nothing; replay it with the `replay` tool)
     -c CONFIG   path to YAML config
     -i DIR      directory to scan/watch for event devices
@@ -371,15 +374,14 @@ Handy for trying config changes before restarting the service:
 1. **Grab** — keyboards are opened via libevdev and exclusively grabbed, so
    nothing else on the system sees their raw events. The daemon refuses to
    grab its own virtual output (that would be an instant feedback loop).
-2. **Filter** — a per-device radio-button state machine tracks the two keys
-   and whichever virtual key is currently active. Pressing the second
-   key while the first is held releases the first virtual key and presses
+2. **Filter** — a per-device, per-pair state machine tracks the pair's two
+   keys and which one is currently active. Pressing the second
+   key while the first is held releases the first and presses
    the second ("release-then-press", always separated by `SYN_REPORT`s).
    Releasing a key while the other is still held re-presses the other
-   virtual key (in `toggle` mode; `snappy` only does this when the active
-   key was released). In `off` mode the state machine is bypassed entirely
-   and k1/k2 are remapped one-to-one to v1/v2. In `analog` mode the
-   digital events for k1/k2 on that keyboard are dropped and the
+   (in `trill` mode; `last` only does this when the active key was
+   released). In `analog` mode the digital events for the pair's keys on
+   that keyboard are dropped and the
    same state machine is driven instead by press/release edges synthesized
    from travel depth, read from the keyboard's analog hidraw interface on
    the same epoll loop.

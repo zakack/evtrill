@@ -19,10 +19,11 @@ static void test_emit(unsigned type, unsigned code, int value);
 #include "doubletapd.c"
 #undef main
 
-#define V1 44   /* KEY_Z */
-#define V2 45   /* KEY_X */
-#define V3 46   /* KEY_C - the second pair's virtuals (cases W, X) */
-#define V4 47   /* KEY_V */
+/* The codes the log names v1..v4: pair 0's keys, then pair 1's. A pair's
+ * keys are re-emitted under their own codes, so these are the keys each case
+ * configures - case X swaps in its own and puts these back. */
+#define VCODES_DEFAULT { KEY_Z, KEY_X, KEY_A, KEY_S }
+static int vcode[4] = VCODES_DEFAULT;
 
 static char log_buf[512];
 static int  fails;
@@ -44,9 +45,11 @@ static unsigned vrepeats;
 
 static void test_emit(unsigned type, unsigned code, int value) {
     if (type != EV_KEY) return;                    /* ignore SYN */
-    if (code != V1 && code != V2 && code != V3 && code != V4)
-        return;                         /* passthrough, not a virtual */
-    int k = code == V1 ? 0 : code == V2 ? 1 : code == V3 ? 2 : 3;
+    int k = 0;
+    while (k < 4 && vcode[k] != (int)code)
+        k++;
+    if (k == 4)
+        return;                         /* passthrough, not a pair key */
     /* Autorepeat is not a transition: the kernel forwards value 2 to
      * userspace and leaves the key down. Counting it separately keeps it out
      * of the press/release log while still letting a test assert it was
@@ -159,8 +162,8 @@ static void dfresh(int socd) {
     memset(&ds, 0, sizeof ds);
     dcfg.n_pairs      = 1;
     dcfg.pair[0].socd = socd;
-    dcfg.pair[0].v1   = V1;
-    dcfg.pair[0].v2   = V2;
+    dcfg.pair[0].k1   = KEY_Z;
+    dcfg.pair[0].k2   = KEY_X;
     memset(vstate, 0, sizeof vstate);
     vpresses  = 0;
     vrepeats  = 0;
@@ -186,8 +189,8 @@ int main(void) {
     memset(&cfg, 0, sizeof cfg);
     cfg.n_pairs      = 1;
     cfg.pair[0].socd = SOCD_ANALOG;
-    cfg.pair[0].v1   = V1;
-    cfg.pair[0].v2   = V2;
+    cfg.pair[0].k1   = KEY_Z;
+    cfg.pair[0].k2   = KEY_X;
     /* The daemon defaults, so the numbers here are the ones a player sees:
      * backplate at 3.80mm (95% of travel), latch disarms at 1.00mm. */
     cfg.analog.travel_mm     = 4.00f;
@@ -712,11 +715,11 @@ int main(void) {
         memset(&pc, 0, sizeof pc);
         pc.analog    = cfg.analog;
         pc.n_pairs   = 2;
-        pc.pair[0]   = (keypair_t){ .k1 = KEY_Z, .k2 = KEY_X, .v1 = V1,
-                                    .v2 = V2, .socd = SOCD_ANALOG,
+        pc.pair[0]   = (keypair_t){ .k1 = KEY_Z, .k2 = KEY_X,
+                                    .socd = SOCD_ANALOG,
                                     .hid_k1 = -1, .hid_k2 = -1 };
-        pc.pair[1]   = (keypair_t){ .k1 = KEY_A, .k2 = KEY_S, .v1 = V3,
-                                    .v2 = V4, .socd = SOCD_ANALOG,
+        pc.pair[1]   = (keypair_t){ .k1 = KEY_A, .k2 = KEY_S,
+                                    .socd = SOCD_ANALOG,
                                     .hid_k1 = -1, .hid_k2 = -1 };
 
         int fd[2];
@@ -850,10 +853,12 @@ skip_w:
         oid_config_t pc;
         memset(&pc, 0, sizeof pc);
         pc.n_pairs = 2;
-        pc.pair[0] = (keypair_t){ .k1 = KEY_D, .k2 = KEY_F, .v1 = V1,
-                                  .v2 = V2, .socd = SOCD_TOGGLE };
-        pc.pair[1] = (keypair_t){ .k1 = KEY_J, .k2 = KEY_K, .v1 = V3,
-                                  .v2 = V4, .socd = SOCD_TOGGLE };
+        pc.pair[0] = (keypair_t){ .k1 = KEY_D, .k2 = KEY_F,
+                                  .socd = SOCD_TOGGLE };
+        pc.pair[1] = (keypair_t){ .k1 = KEY_J, .k2 = KEY_K,
+                                  .socd = SOCD_TOGGLE };
+        const int xcodes[4] = { KEY_D, KEY_F, KEY_J, KEY_K };
+        memcpy(vcode, xcodes, sizeof vcode);
         input_dev_t in;
         memset(&in, 0, sizeof in);
         memset(vstate, 0, sizeof vstate);
@@ -901,41 +906,51 @@ skip_w:
         expect_log("device dies holding both pairs: both released",
                    "v1- v4-");
         #undef KEY
+        const int dcodes[4] = VCODES_DEFAULT;
+        memcpy(vcode, dcodes, sizeof vcode);
     }
 
     puts("Y. config: a closed schema, and pairs share nothing");
     {
         /* `msg` must appear in what a refusal logs, so a case cannot pass
          * by being refused for some unrelated reason. */
-        #define PAIR_FJ "  - {k1: KEY_F, k2: KEY_J, v1: KEY_1, v2: KEY_2}\n"
+        #define PAIR_FJ "  - {keys: [KEY_F, KEY_J]}\n"
         static const struct { const char *what, *yaml; int ok, n;
                               const char *msg; } cf[] = {
-            { "one pair, with its socd and a hid override",
-              "pairs:\n  - {k1: KEY_Z, k2: KEY_X, v1: KEY_Z, v2: KEY_X, "
-              "socd: analog, hid_k1: 0x1d}\n", 1, 1, NULL },
-            { "two pairs, socd defaulted from the top",
-              "socd: snappy\npairs:\n"
-              "  - {k1: KEY_F, k2: KEY_J, v1: KEY_F, v2: KEY_J, socd: analog}\n"
-              "  - {k1: KEY_D, k2: KEY_K, v1: KEY_D, v2: KEY_K}\n", 1, 2, NULL },
+            { "one pair, with its mode and a hid override",
+              "pairs:\n  - {keys: [KEY_Z, KEY_X], mode: analog, "
+              "hid: [0x1d, auto]}\n", 1, 1, NULL },
+            { "two pairs, mode defaulted from the top",
+              "mode: last\npairs:\n"
+              "  - {keys: [KEY_F, KEY_J], mode: analog}\n"
+              "  - {keys: [KEY_D, KEY_K]}\n", 1, 2, NULL },
             { "no pairs: is refused - there is no built-in pair",
-              "socd: toggle\n", 0, 0, "'pairs' is required" },
+              "mode: trill\n", 0, 0, "'pairs' is required" },
             { "a typo at the root is refused",
               "pair:\n" PAIR_FJ, 0, 0, "unknown key 'pair'" },
-            { "the old keys: spelling is just an unknown key",
+            { "the old socd: field is just an unknown key",
+              "socd: toggle\npairs:\n" PAIR_FJ, 0, 0,
+              "unknown key 'socd'" },
+            { "the old keys: block is just an unknown key",
               "keys: {k1: KEY_Z, k2: KEY_X}\npairs:\n" PAIR_FJ, 0, 0,
               "unknown key 'keys'" },
             { "an old audio: block is just an unknown key",
               "audio: {enabled: true}\npairs:\n" PAIR_FJ, 0, 0,
               "unknown key 'audio'" },
-            { "an unknown key on a pair is refused",
-              "pairs:\n  - {k1: KEY_F, k2: KEY_J, v1: KEY_1, v2: KEY_2, "
-              "scod: off}\n", 0, 0, "unknown key 'pairs[0].scod'" },
+            { "the old k1/v1 spelling on a pair is refused",
+              "pairs:\n  - {k1: KEY_F, k2: KEY_J, v1: KEY_1, v2: KEY_2}\n",
+              0, 0, "unknown key 'pairs[0].k1'" },
+            { "an old mode name is refused, synonyms included",
+              "pairs:\n  - {keys: [KEY_F, KEY_J], mode: toggle}\n", 0, 0,
+              "'pairs[0].mode' must be" },
+            { "'off' is not a mode any more",
+              "mode: off\npairs:\n" PAIR_FJ, 0, 0, "'mode' must be" },
+            { "keys must be exactly two",
+              "pairs:\n  - {keys: [KEY_F, KEY_J, KEY_K]}\n", 0, 0,
+              "'pairs[0].keys' must be a list of two keys" },
             { "an unknown key under analog is refused",
               "pairs:\n" PAIR_FJ "analog: {gate: true}\n", 0, 0,
               "unknown key 'analog.gate'" },
-            { "analog.hid_k1 is refused: overrides live on the pair",
-              "pairs:\n" PAIR_FJ "analog: {hid_k1: 0x09}\n", 0, 0,
-              "unknown key 'analog.hid_k1'" },
             { "an unknown key under rapid_trigger is refused",
               "pairs:\n" PAIR_FJ "analog: {rapid_trigger: "
               "{deep_press_mm: 1}}\n", 0, 0,
@@ -944,27 +959,25 @@ skip_w:
               "pairs:\n" PAIR_FJ "uinput: {nmae: x}\n", 0, 0,
               "unknown key 'uinput.nmae'" },
             { "a key given twice is refused",
-              "socd: off\nsocd: toggle\npairs:\n" PAIR_FJ, 0, 0,
-              "'socd' is given more than once" },
-            { "a physical key in two pairs is refused",
-              "pairs:\n" PAIR_FJ
-              "  - {k1: KEY_J, k2: KEY_K, v1: KEY_3, v2: KEY_4}\n", 0, 0,
-              "share a physical key" },
-            { "a virtual key in two pairs is refused",
-              "pairs:\n" PAIR_FJ
-              "  - {k1: KEY_D, k2: KEY_K, v1: KEY_2, v2: KEY_3}\n", 0, 0,
-              "share a virtual key" },
+              "mode: last\nmode: trill\npairs:\n" PAIR_FJ, 0, 0,
+              "'mode' is given more than once" },
+            { "both keys of a pair the same is refused",
+              "pairs:\n  - {keys: [KEY_F, KEY_F]}\n", 0, 0,
+              "both keys are the same key" },
+            { "a key in two pairs is refused",
+              "pairs:\n" PAIR_FJ "  - {keys: [KEY_J, KEY_K]}\n", 0, 0,
+              "share a key" },
             { "one hid override in two pairs is refused",
               "pairs:\n"
-              "  - {k1: KEY_F, k2: KEY_J, v1: KEY_1, v2: KEY_2, hid_k1: 9}\n"
-              "  - {k1: KEY_D, k2: KEY_K, v1: KEY_3, v2: KEY_4, hid_k2: 9}\n",
+              "  - {keys: [KEY_F, KEY_J], hid: [9, auto]}\n"
+              "  - {keys: [KEY_D, KEY_K], hid: [auto, 9]}\n",
               0, 0, "both override a key to hid 0x09" },
             { "hid usage 0 is refused",
-              "pairs:\n  - {k1: KEY_F, k2: KEY_J, v1: KEY_1, v2: KEY_2, "
-              "hid_k1: 0}\n", 0, 0, "'pairs[0].hid_k1' must be" },
-            { "a pair entry missing a key is refused",
-              "pairs:\n  - {k1: KEY_F, k2: KEY_J, v1: KEY_1}\n", 0, 0,
-              "'pairs[0].v2' is required" },
+              "pairs:\n  - {keys: [KEY_F, KEY_J], hid: [0, auto]}\n", 0, 0,
+              "'pairs[0].hid' must be" },
+            { "a pair entry without keys is refused",
+              "pairs:\n  - {mode: last}\n", 0, 0,
+              "'pairs[0].keys' is required" },
         };
         #undef PAIR_FJ
         char path[] = "/tmp/regimetest-XXXXXX";
@@ -1006,12 +1019,12 @@ skip_w:
             if (rc == 0 && cf[i].ok) {
                 expect_int("  pair count", yc.n_pairs, cf[i].n);
                 if (i == 0)
-                    expect_int("  socd and hid_k1 on the pair",
+                    expect_int("  mode and hid on the pair",
                                yc.pair[0].hid_k1 == 0x1d &&
                                yc.pair[0].hid_k2 == -1 &&
                                yc.pair[0].socd == SOCD_ANALOG, 1);
                 if (i == 1)
-                    expect_int("  per-pair socd, and the default",
+                    expect_int("  per-pair mode, and the default",
                                yc.pair[0].socd == SOCD_ANALOG &&
                                yc.pair[1].socd == SOCD_SNAPPY, 1);
                 config_free(&yc);
