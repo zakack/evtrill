@@ -35,7 +35,8 @@ never a trill.
 
 ### Arch Linux
 
-An AUR package is coming.
+Install [`evtrill`](https://aur.archlinux.org/packages/evtrill) from the AUR,
+e.g. `yay -S evtrill`, then follow [Setup](#setup).
 
 ### From source
 
