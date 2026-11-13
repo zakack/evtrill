@@ -76,6 +76,9 @@
 #ifndef DEF_CONFIG
 #define DEF_CONFIG "/usr/share/evtrill/config.yaml"
 #endif
+#ifndef EVTRILL_VERSION
+#define EVTRILL_VERSION "unknown"
+#endif
 
 /* ------------------------------------------------------------------------- */
 /* Logging                                                                   */
@@ -2730,16 +2733,16 @@ static int run_loop(dev_list_t *devs, const oid_config_t *cfg,
 
 static void print_usage(FILE *s, const char *prog) {
     fprintf(s,
-        "evtrill - two-key trill daemon for rhythm games\n"
+        "evtrill " EVTRILL_VERSION " - two-key trill daemon for rhythm games\n"
         "\n"
         "Grabs evdev keyboard devices, runs a state machine over each configured\n"
         "pair of keys, and re-emits everything via a single uinput virtual\n"
         "keyboard. Each pair's 'mode':\n"
         "\n"
-        "    trill   with both keys held, every press or release of either is\n"
+        "    trill   with both keys held, every stroke or release of either is\n"
         "            the next note, alternating\n"
-        "    last    last input wins (as sold as Snap Tap / Snappy Tappy)\n"
-        "    analog  needs an analog keyboard: each key acts on its own, with a\n"
+        "    last    the newest stroke wins (as sold as Snap Tap / Snappy Tappy)\n"
+        "    analog  needs an analog keyboard: each key is independent, with a\n"
         "            software rapid trigger, until both are planted on the\n"
         "            backplate; then they trill until both leave it\n"
         "\n"
@@ -2806,7 +2809,7 @@ main(int argc, char **argv) {
 
     if (!config_path)
         config_path = default_config_path();
-    LOG_INFO("Using config %s", config_path);
+    LOG_INFO("evtrill %s, using config %s", EVTRILL_VERSION, config_path);
 
     oid_config_t cfg;
     config_init(&cfg);

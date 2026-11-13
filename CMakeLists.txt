@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.13)
 
-project(evtrill VERSION 1.0.0 LANGUAGES C)
+project(evtrill VERSION 0.1.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -33,6 +33,7 @@ endif()
 add_executable(evtrill evtrill.c)
 
 target_compile_definitions(evtrill PRIVATE
+    EVTRILL_VERSION="${PROJECT_VERSION}"
     SYS_CONFIG="${CMAKE_INSTALL_FULL_SYSCONFDIR}/evtrill/config.yaml"
     DEF_CONFIG="${CMAKE_INSTALL_FULL_DATADIR}/evtrill/config.yaml"
 )
@@ -70,6 +71,7 @@ foreach(tool replay machinetest)
     add_executable(${tool} tools/${tool}.c)
 
     target_compile_definitions(${tool} PRIVATE
+        EVTRILL_VERSION="${PROJECT_VERSION}"
         SYS_CONFIG="${CMAKE_INSTALL_FULL_SYSCONFDIR}/evtrill/config.yaml"
         DEF_CONFIG="${CMAKE_INSTALL_FULL_DATADIR}/evtrill/config.yaml"
     )
