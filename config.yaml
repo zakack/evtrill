@@ -96,7 +96,7 @@ pairs:
 # Because the backplate is a hard physical stop, this is a trigger you can
 # aim - "plant both keys to start rocking" is something you can actually do,
 # unlike "cross some depth in the middle of travel". Where the backplate
-# starts is rapid_trigger.bottom_out_mm, the single most important number
+# starts is analog.backplate_mm, the single most important number
 # here: it defines the latch AND the rapid-trigger bottom-out line.
 #
 # Arming is silent - it emits no press, since the notes for both keys
@@ -130,8 +130,16 @@ pairs:
 # analog:
 #   device: auto          # or an explicit /dev/hidrawN
 #   travel_mm: 4.0        # full key travel (Wooting 60HE+ is 4.0)
-#   actuation_mm: 1.0     # press threshold while TAPPING. Not used while
-#                         # riding, where the backplate is the switch.
+#   actuation_mm: 1.0     # where an independent key goes down. Not used
+#                         # while armed, where the backplate is the switch.
+#   backplate_mm: 0.2     # where the backplate starts, measured from full
+#                         # travel: 0.2 on a 4.0mm switch = 95%. Bottoming
+#                         # out always presses however small the
+#                         # down-travel, it is what arms the latch when
+#                         # both keys reach it, and while the latch is armed
+#                         # it is the ONLY threshold. Must be > 0; keep
+#                         # it under ~10% of travel, or a firm stroke can
+#                         # reach it and alt-tapping may arm the latch.
 #   latch_debounce_ms: 0  # how long BOTH keys must stay on the backplate
 #                         # before the latch arms. 0 arms on the first
 #                         # report with both planted. Raise it if hard
@@ -143,16 +151,8 @@ pairs:
 #                         # debounced.
 #   rapid_trigger:
 #     enabled: true
-#     press_mm: 0.3       # downward reversal that re-presses  } tapping
+#     press_mm: 0.3       # downward reversal that re-presses  } independent
 #     release_mm: 0.3     # upward reversal that releases      } only
-#     bottom_out_mm: 0.2  # where the backplate starts, measured from full
-#                         # travel: 0.2 on a 4.0mm switch = 95%. Bottoming
-#                         # out always presses however small the
-#                         # down-travel, it is what arms the deep latch when
-#                         # both keys reach it, and while the latch is armed
-#                         # it is the ONLY threshold. Must be > 0; keep
-#                         # it under ~10% of travel, or a firm tap can
-#                         # reach it and alt-tapping may arm the latch.
 
 # Identification of the virtual uinput keyboard.
 uinput:

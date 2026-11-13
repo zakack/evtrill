@@ -1,27 +1,27 @@
 /*
- * evtrill - Rapid-fire virtual keyboard daemon
+ * evtrill - two-key trill daemon for rhythm games
  *
  * The daemon directly opens (and exclusively grabs) one or more evdev
  * keyboard devices - either an explicit config list or, by default,
  * every keyboard-shaped device that advertises every configured key
  * (with inotify-driven hotplug either way) - runs a state machine over
  * each configured pair of keys, and mirrors every other event verbatim
- * into a single uinput virtual keyboard. A pair's keys keep their own
+ * through a single uinput virtual keyboard. A pair's keys keep their own
  * codes; what the machine changes is WHEN they go down and up. Modes,
  * per pair:
  *
- *   trill  - with both keys held, every press or release of either one
- *            is the next note, alternating (a reverting toggle)
- *   last   - last input wins; releasing the active key falls back to the
- *            held one, releasing the suppressed one does nothing
- *   analog - each key acts on its own (by travel, with a software rapid
+ *   trill  - with both keys held, every stroke or release of either one
+ *            is the next note, alternating
+ *   last   - the newest stroke wins; releasing the active key falls back
+ *            to the held one, releasing the suppressed one does nothing
+ *   analog - each key is independent (by travel, with a software rapid
  *            trigger) until both are planted on the backplate, then they
  *            trill until both leave it
  *
  * In analog mode the keyboard's travel depth is read straight off its
- * vendor HID interface and the `deep` latch decides which machine is in
+ * vendor HID interface and the latch decides which rule is in
  * force: it arms when BOTH keys are on the backplate in one report and
- * disarms when BOTH are off it. See analog_deep_update.
+ * disarms when BOTH are off it. See analog_latch_update.
  *
  * Copyright 2026 Zachary Kessler
  */
@@ -119,22 +119,22 @@ static void on_signal(int sig) {
 /* Config                                                                    */
 /* ------------------------------------------------------------------------- */
 
-/* A pair's mode (see socd_apply). TOGGLE, SNAPPY and ANALOG are the config's
- * `trill`, `last` and `analog`. OFF is not a mode a config can name: it is
- * the analog path's unarmed state, each key passing through one-to-one. */
+/* A pair's mode (see machine_apply). TRILL, LAST and ANALOG are the config's
+ * `trill`, `last` and `analog`. INDEPENDENT is not a mode a config can
+ * name: it is an analog pair's state while its latch is disarmed. */
 enum {
-    SOCD_TOGGLE = 0, /* trill: reverting toggle (latching) */
-    SOCD_SNAPPY = 1, /* last: only the active key's release reverts */
-    SOCD_OFF    = 2, /* pass-through: analog mode with the latch unarmed */
-    SOCD_ANALOG = 3, /* trill, gated by travel depth (see analog_key_t) */
+    MODE_TRILL       = 0, /* both held: every stroke or release is a note */
+    MODE_LAST        = 1, /* the newest stroke wins */
+    MODE_INDEPENDENT = 2, /* each key on its own; never configured */
+    MODE_ANALOG      = 3, /* independent until planted, then trill */
 };
 
 static const char *mode_name(int m) {
     switch (m) {
-    case SOCD_TOGGLE: return "trill";
-    case SOCD_SNAPPY: return "last";
-    case SOCD_ANALOG: return "analog";
-    default:          return "pass";
+    case MODE_TRILL: return "trill";
+    case MODE_LAST: return "last";
+    case MODE_ANALOG: return "analog";
+    default:          return "independent";
     }
 }
 
@@ -154,44 +154,39 @@ typedef struct {
                            * ranges from 0.1mm to most of the travel, and a
                            * subtraction that suits one end goes negative at
                            * the other. */
-    /* bottom_out_mm defines the backplate, and the backplate is the whole
-     * gesture: both keys on it at once is what arms `deep` and hands
-     * k1/k2 to the toggle. It does triple duty, deliberately - one
-     * number, so there is one place to tune how far down "planted" means:
-     * the tapping bottom-out re-press, the latch threshold, and the only
-     * threshold in force while riding. */
+    /* backplate_mm defines the backplate, and the backplate is the whole
+     * gesture: a plant is what arms the latch and hands k1/k2 to the
+     * trill. It does triple duty, deliberately - one number, so there is
+     * one place to tune how far down "planted" means: the independent
+     * bottom-out re-press, the latch threshold, and the only threshold in
+     * force while armed. */
     int    rt_enabled;
-    /* Rapid trigger is TAPPING-ONLY. While the latch is armed the backplate
-     * is the switch and neither reversal distance runs at all - riding
-     * bottoms out every stroke by definition, so every note in a burst
-     * lands on the same hard physical line. (An earlier revision ran a
-     * second `deep_press_mm`/`deep_release_mm` profile here; those config
-     * keys were removed, and load_config warns if it still finds them.) */
+    /* Rapid trigger runs only while INDEPENDENT. While the latch is armed
+     * the backplate is the switch and neither reversal distance runs at
+     * all - rocking bottoms out every stroke by definition, so every note
+     * in a burst lands on the same hard physical line. */
     float  rt_press_mm;   /* downward reversal that re-presses */
     float  rt_release_mm; /* upward reversal that releases */
-    float  bottom_out_mm; /* within this of full travel == bottomed out:
-                           * presses regardless of rt_press_mm, and, for
-                           * both keys at once, arms `deep` */
+    float  backplate_mm;  /* within this of full travel == on the
+                           * backplate: presses regardless of rt_press_mm,
+                           * and, for both keys at once, arms the latch */
     float  latch_debounce_ms; /* how long BOTH keys must stay on the
-                               * backplate before `deep` arms. 0 == the
+                               * backplate before the latch arms. 0 == the
                                * first report with both planted arms it.
                                * Disarming is never debounced. */
 } analog_config_t;
 
-/* One SOCD state machine: two physical keys driving two virtual ones, under
- * its own mode. A config carries up to MAX_PAIRS of them, all on the one
+/* One pair: two keys run by one state machine, under its own mode.
+ * A config carries up to MAX_PAIRS of them, all on the one
  * virtual keyboard and all independent - a pair never sees another pair's
  * keys, which is the point (taiko: dons on one pair, kats on the other, a
  * don and a kat together are two notes, not a rock). The analog thresholds
  * are NOT per pair: they describe the board, and there is one board. */
 #define MAX_PAIRS 8
 
-/* A pair's keys are physical AND virtual: the machine re-emits k1/k2 under
- * their own codes, deciding only when they go down and up. Mapping them to
- * other codes is a remapper's job, and the game's keybinds already do it. */
 typedef struct {
     int k1, k2;
-    int socd;             /* the pair's mode */
+    int mode;             /* the pair\'s mode */
     int hid_k1;           /* HID usage override; -1 == derive from the keymap */
     int hid_k2;
 } keypair_t;
@@ -210,7 +205,7 @@ typedef struct {
  * analog config check all hang off this rather than one global mode. */
 static int cfg_any_analog(const oid_config_t *c) {
     for (int i = 0; i < c->n_pairs; i++)
-        if (c->pair[i].socd == SOCD_ANALOG)
+        if (c->pair[i].mode == MODE_ANALOG)
             return 1;
     return 0;
 }
@@ -220,7 +215,7 @@ static int cfg_any_analog(const oid_config_t *c) {
  * format - so with several pairs it is one pair's session, not all of them. */
 static int cfg_trace_pair(const oid_config_t *c) {
     for (int i = 0; i < c->n_pairs; i++)
-        if (c->pair[i].socd == SOCD_ANALOG)
+        if (c->pair[i].mode == MODE_ANALOG)
             return i;
     return 0;
 }
@@ -230,7 +225,7 @@ static void config_init(oid_config_t *c) {
     c->n_pairs        = 1;
     c->pair[0].k1     = DEF_K1;
     c->pair[0].k2     = DEF_K2;
-    c->pair[0].socd   = SOCD_TOGGLE;
+    c->pair[0].mode   = MODE_TRILL;
     c->pair[0].hid_k1 = -1;   /* sentinel: derive from the keymap */
     c->pair[0].hid_k2 = -1;
     c->analog.travel_mm     = 4.0f;
@@ -238,7 +233,7 @@ static void config_init(oid_config_t *c) {
     c->analog.rt_enabled    = 1;
     c->analog.rt_press_mm   = 0.3f;
     c->analog.rt_release_mm = 0.3f;
-    c->analog.bottom_out_mm = 0.20f;  /* 95% of the 4mm default travel */
+    c->analog.backplate_mm = 0.20f;  /* 95% of the 4mm default travel */
 }
 
 static void config_free(oid_config_t *c) {
@@ -356,7 +351,7 @@ static void analog_config_resolve(analog_config_t *a) {
 
 /* Thresholds that are individually well-formed can still combine into a
  * broken machine, and the failure modes are hard to attribute while playing:
- * a key that self-oscillates at the report rate, or one whose deep latch can
+ * a key that self-oscillates at the report rate, or one whose latch can
  * never clear. Reject those outright rather than let them reach the RT path.
  * Only enforced with an analog pair - an unused analog block stays harmless. */
 static int analog_config_check(const analog_config_t *a) {
@@ -381,31 +376,31 @@ static int analog_config_check(const analog_config_t *a) {
     }
     /* The backplate is load-bearing now: it defines the gesture, not just
      * a rapid-trigger corner case. */
-    if (a->bottom_out_mm <= 0.0f) {
-        LOG_ERR("'analog.rapid_trigger.bottom_out_mm' must be greater than "
+    if (a->backplate_mm <= 0.0f) {
+        LOG_ERR("'analog.backplate_mm' must be greater than "
                 "0: it defines where the backplate starts, and both keys "
-                "reaching it is what arms the deep latch");
+                "reaching it is what arms the latch");
         bad = 1;
     }
     /* Actuation has to sit above the backplate: with the line at or past
-     * the floor a key could reach the backplate without ever having
-     * actuated, so the plain remap would never press it, and with it past
+     * the backplate a key could reach the backplate without ever having
+     * actuated, so independent would never press it, and with it past
      * travel_mm the key could never actuate at all. Both are silent
      * bricks. */
-    if (a->travel_mm > 0.0f && a->bottom_out_mm > 0.0f &&
-        a->actuation_mm >= a->travel_mm - a->bottom_out_mm) {
+    if (a->travel_mm > 0.0f && a->backplate_mm > 0.0f &&
+        a->actuation_mm >= a->travel_mm - a->backplate_mm) {
         LOG_ERR("'analog.actuation_mm' (%.3f) must be shallower than the "
-                "backplate at %.3fmm (travel_mm - bottom_out_mm), otherwise "
-                "a key can reach the floor without ever actuating",
+                "backplate at %.3fmm (travel_mm - backplate_mm), otherwise "
+                "a key can reach the backplate without ever actuating",
                 (double)a->actuation_mm,
-                (double)(a->travel_mm - a->bottom_out_mm));
+                (double)(a->travel_mm - a->backplate_mm));
         bad = 1;
     }
-    if (a->bottom_out_mm >= a->travel_mm) {
-        LOG_ERR("'analog.rapid_trigger.bottom_out_mm' (%.3f) must be less "
+    if (a->backplate_mm >= a->travel_mm) {
+        LOG_ERR("'analog.backplate_mm' (%.3f) must be less "
                 "than travel_mm (%.3f): every sample would count as "
                 "bottomed",
-                (double)a->bottom_out_mm, (double)a->travel_mm);
+                (double)a->backplate_mm, (double)a->travel_mm);
         bad = 1;
     }
     if (bad)
@@ -421,13 +416,13 @@ static int analog_config_check(const analog_config_t *a) {
     /* A backplate under 90% of travel is reachable by a firm tap, and a tap
      * that reaches it is a tap that can arm the latch - which is exactly the
      * alt-tapping misfire the latch exists to avoid. */
-    if (a->travel_mm > 0.0f && a->bottom_out_mm > 0.10f * a->travel_mm)
-        LOG_WARN("'analog.rapid_trigger.bottom_out_mm' (%.3f) puts the "
-                 "backplate at %.1f%% of travel: below ~90%% a firm tap can "
-                 "reach it, and two overlapping taps could arm the deep "
-                 "latch. Record a session with -T and check it with `replay`",
-                 (double)a->bottom_out_mm,
-                 (double)((a->travel_mm - a->bottom_out_mm)
+    if (a->travel_mm > 0.0f && a->backplate_mm > 0.10f * a->travel_mm)
+        LOG_WARN("'analog.backplate_mm' (%.3f) puts the "
+                 "backplate at %.1f%% of travel: below ~90%% a firm stroke "
+                 "can reach it, and an overlap while alt-tapping could arm "
+                 "the latch. Record a session with -T and check it with `replay`",
+                 (double)a->backplate_mm,
+                 (double)((a->travel_mm - a->backplate_mm)
                           / a->travel_mm * 100.0f));
     return 0;
 }
@@ -455,17 +450,17 @@ static int parse_key_code(yaml_node_t *n, int *out) {
     return 0;
 }
 
-/* mode: "trill", "last" or "analog". One spelling each, no synonyms. */
+/* mode: "trill", "last" or "analog". */
 #define MODE_VALUES "\"trill\", \"last\" or \"analog\""
 static int parse_mode(yaml_node_t *n, int *out) {
     const char *s = n && n->type == YAML_SCALAR_NODE
                     ? (const char *)n->data.scalar.value : "";
     if (!strcmp(s, "trill"))
-        *out = SOCD_TOGGLE;
+        *out = MODE_TRILL;
     else if (!strcmp(s, "last"))
-        *out = SOCD_SNAPPY;
+        *out = MODE_LAST;
     else if (!strcmp(s, "analog"))
-        *out = SOCD_ANALOG;
+        *out = MODE_ANALOG;
     else
         return -1;
     return 0;
@@ -515,7 +510,7 @@ static int parse_pair_entry(yaml_document_t *doc, yaml_node_t *map,
     static const char *const allowed[] = { "keys", "mode", "hid", NULL };
     if (map_check(doc, map, where, allowed) != 0)
         return -1;
-    p->socd   = def_mode;
+    p->mode   = def_mode;
     p->hid_k1 = p->hid_k2 = -1;
 
     yaml_node_t *two[2];
@@ -536,7 +531,7 @@ static int parse_pair_entry(yaml_document_t *doc, yaml_node_t *map,
         }
 
     yaml_node_t *mn = map_get(doc, map, "mode");
-    if (mn && parse_mode(mn, &p->socd) != 0) {
+    if (mn && parse_mode(mn, &p->mode) != 0) {
         LOG_ERR("'%s.mode' must be " MODE_VALUES, where);
         return -1;
     }
@@ -673,15 +668,14 @@ static int load_config(const char *path, oid_config_t *c) {
 
     /* mode: optional scalar - the default for every `pairs:` entry that
      * does not name its own. */
-    int def_mode = SOCD_TOGGLE;
+    int def_mode = MODE_TRILL;
     yaml_node_t *mode = map_get(&doc, root, "mode");
     if (mode && parse_mode(mode, &def_mode) != 0) {
         LOG_ERR("'mode' must be " MODE_VALUES);
         goto out;
     }
 
-    /* pairs: required. There is no built-in pair - which keys to take over
-     * is the one thing a config cannot leave to a default. */
+    /* pairs: required. There is no built-in pair. */
     yaml_node_t *pairs = map_get(&doc, root, "pairs");
     if (!pairs) {
         LOG_ERR("'pairs' is required: list at least one pair of keys");
@@ -714,8 +708,8 @@ static int load_config(const char *path, oid_config_t *c) {
             goto out;
         }
         static const char *const analog_keys[] = {
-            "device", "travel_mm", "actuation_mm", "latch_debounce_ms",
-            "rapid_trigger", NULL
+            "device", "travel_mm", "actuation_mm", "backplate_mm",
+            "latch_debounce_ms", "rapid_trigger", NULL
         };
         if (map_check(&doc, an, "analog", analog_keys) != 0)
             goto out;
@@ -732,6 +726,7 @@ static int load_config(const char *path, oid_config_t *c) {
         static const struct { const char *key; size_t off; } mm[] = {
             { "travel_mm",     offsetof(analog_config_t, travel_mm)     },
             { "actuation_mm",  offsetof(analog_config_t, actuation_mm)  },
+            { "backplate_mm",  offsetof(analog_config_t, backplate_mm)  },
             { "latch_debounce_ms",
               offsetof(analog_config_t, latch_debounce_ms) },
         };
@@ -750,7 +745,7 @@ static int load_config(const char *path, oid_config_t *c) {
                 goto out;
             }
             static const char *const rt_keys[] = {
-                "enabled", "press_mm", "bottom_out_mm", "release_mm", NULL
+                "enabled", "press_mm", "release_mm", NULL
             };
             if (map_check(&doc, rt, "analog.rapid_trigger", rt_keys) != 0)
                 goto out;
@@ -762,12 +757,6 @@ static int load_config(const char *path, oid_config_t *c) {
             yaml_node_t *pm = map_get(&doc, rt, "press_mm");
             if (pm && parse_nonneg(pm, &c->analog.rt_press_mm) != 0) {
                 LOG_ERR("'analog.rapid_trigger.press_mm' must be a "
-                        "non-negative number");
-                goto out;
-            }
-            yaml_node_t *bo = map_get(&doc, rt, "bottom_out_mm");
-            if (bo && parse_nonneg(bo, &c->analog.bottom_out_mm) != 0) {
-                LOG_ERR("'analog.rapid_trigger.bottom_out_mm' must be a "
                         "non-negative number");
                 goto out;
             }
@@ -831,16 +820,16 @@ enum { EP_INPUT = 1, EP_ANALOG = 2, EP_LATCH = 3 };
  * latch_timer_sync). */
 static int g_ep_latch = EP_LATCH;
 
-/* SOCD state for one input source. Per-source, not global: several
- * keyboards are tracked independently even though they share one virtual
- * output device, and the analog path carries its own instance too. */
+/* One pair's state machine for one input source. Per-source, not global:
+ * several keyboards are tracked independently even though they share one
+ * virtual keyboard, and the analog path carries its own instance too. */
 typedef struct {
     int k1;   /* k1 down? */
     int k2;   /* k2 down? */
     int act;  /* 1 == k1 active, 0 == k2 (or none) */
     int mode; /* mode of the last edge applied; release_stuck needs the
-               * EFFECTIVE mode, which for the analog path is not cfg->socd */
-} socd_state_t;
+               * EFFECTIVE mode, which for the analog path is not cfg->mode */
+} machine_t;
 
 typedef struct {
     int               kind;    /* EP_INPUT */
@@ -852,7 +841,7 @@ typedef struct {
     int               analog;  /* this is the analog board: its analog-mode
                                 * pairs come from hidraw, so drop their
                                 * digital copies */
-    socd_state_t      socd[MAX_PAIRS]; /* one machine per pair, as configured */
+    machine_t      machine[MAX_PAIRS]; /* one machine per pair, as configured */
 } input_dev_t;
 
 /* Grabbed devices as stable heap pointers: epoll user data points at the
@@ -894,9 +883,7 @@ static int dev_list_has_rdev(const dev_list_t *l, dev_t rdev) {
  * process_event drop their digital k1/k2 so each press is emitted once. */
 static uint16_t g_analog_vid, g_analog_pid;
 
-/* Never grab an evtrill output device: grabbing our own uinput node (or
- * another instance's) feeds every emitted event straight back in as input -
- * an instant feedback loop. Applies in both explicit and auto mode. */
+/* Never grab an evtrill output device. Prevents feedback loops. */
 static int is_evtrill_output(struct libevdev *dev, const oid_config_t *cfg) {
     const char *uniq = libevdev_get_uniq(dev);
     const char *name = libevdev_get_name(dev);
@@ -906,12 +893,9 @@ static int is_evtrill_output(struct libevdev *dev, const oid_config_t *cfg) {
 }
 
 /* Auto-discovery filter: keyboard-shaped devices that advertise every
- * physical key of every pair - a board missing one pair's keys would run that
- * pair's machine with half of it unreachable, so it is not grabbed at all. Devices with pointer/absolute axes are
- * rejected because the virtual device is key-only - grabbing a mouse
- * whose HID descriptor also claims keyboard keys (common on gaming mice)
- * would swallow its motion. Virtual devices (ours, keyd's, ...) are
- * rejected to stay loop-free among remappers. */
+ * physical key of every pair. Devices with pointer/absolute axes are
+ * rejected because the virtual device is key-only. Virtual devices
+ * (ours, keyd's, ...) are rejected to stay loop-free among remappers. */
 static int auto_grab_ok(struct libevdev *dev, const oid_config_t *cfg) {
     if (libevdev_get_id_bustype(dev) == BUS_VIRTUAL) return 0;
     for (int i = 0; i < cfg->n_pairs; i++)
@@ -1216,14 +1200,14 @@ static int analog_decode(int fmt, const unsigned char *buf, size_t len,
 /*
  * Analog front-end for one physical key: turns a stream of travel-depth
  * samples (mm) into the same press/release edges the digital evdev path
- * feeds the SOCD core.
+ * feeds the state machine.
  *
  * Two thresholds instead of one is the whole feature, but they answer
  * different questions. actuation_mm means "this is a keypress" and is the
  * only thing that decides whether an edge is emitted here. The backplate
- * (travel_mm - bottom_out_mm) means "this key is against the floor", and
+ * (travel_mm - backplate_mm) means "this key is on the backplate", and
  * this function uses it for one thing only: the bottom-out re-press rule.
- * Whether the PAIR of keys is on the floor is analog_deep_update's
+ * Whether the PAIR of keys is on the backplate is analog_latch_update's
  * business, and it reads the two depths directly rather than any latch
  * kept here - which is why this struct holds no commitment flag.
  *
@@ -1250,7 +1234,7 @@ static int analog_decode(int fmt, const unsigned char *buf, size_t len,
  *      check runs instead.
  *
  * Every branch that flips `live` is the branch that appends the matching
- * edge, so `live` cannot desynchronize from what was emitted - socd_apply
+ * edge, so `live` cannot desynchronize from what was emitted - machine_apply
  * downstream assumes strict press/release alternation per key.
  */
 typedef struct {
@@ -1268,31 +1252,27 @@ typedef struct {
  * early and rules 2/3 are mutually exclusive, so no path emits two. The
  * array is kept at two so callers need not change if that ever does. */
 static int analog_key_feed(analog_state_t *st, int idx, float depth_mm,
-                           const analog_config_t *cfg, int riding, int *out) {
+                           const analog_config_t *cfg, int armed, int *out) {
     analog_key_t *self = &st->key[idx];
     int           n    = 0;
 
-    /* 0. Riding: the backplate IS the switch, and rapid trigger does not run
+    /* 0. Armed: the backplate IS the switch, and rapid trigger does not run
      * at all.
      *
      * This is the whole simplification. While the latch is armed the player
-     * is bottoming out every stroke by definition - that is what riding is -
-     * so the only threshold that means anything is the floor. Synthesizing
-     * edges from reversal distances here was solving a problem the gesture
-     * does not have, and it made the note land at a different depth
-     * depending on how far the finger happened to travel.
+     * is bottoming out every stroke by definition - that is what rocking is -
+     * so the only threshold that means anything is the backplate.
      *
      * No hysteresis is needed and none is wanted: the backplate is a
      * physical stop, so a finger is either against it (reading full travel)
-     * or off it. You cannot hover on a hard surface, which is the same
-     * property that makes the latch itself aimable.
+     * or off it.
      *
      * `rt_extreme` is kept at the current depth purely so the handoff OUT of
-     * riding has a sane anchor - see analog_deep_set, which clears `live` and
-     * leaves this parked, putting the key in the "engaged but not live" state
-     * the tapping profile understands. */
-    if (riding) {
-        int on = depth_mm >= cfg->travel_mm - cfg->bottom_out_mm;
+     * the armed state has a sane anchor - see analog_latch_set, which clears
+     * `live` and leaves this parked, putting the key in the "engaged but not
+     * live" state the independent rules understand. */
+    if (armed) {
+        int on = depth_mm >= cfg->travel_mm - cfg->backplate_mm;
         self->rt_extreme = depth_mm;
         if (on != self->live) {
             self->live = on;
@@ -1311,18 +1291,16 @@ static int analog_key_feed(analog_state_t *st, int idx, float depth_mm,
         return n;
     }
 
-    /* Only the tapping profile reaches here: rule 0 returned for every
-     * riding sample, so there is one set of distances and nothing selects
-     * between them. An earlier design ran a second "deep" profile here and
-     * picked between the two by the latch; the backplate rule above replaces
-     * it outright. */
+    /* Only an independent key reaches here: rule 0 returned for every
+     * armed report, so there is one set of distances and nothing selects
+     * between them. */
     float press   = cfg->rt_press_mm;
     float release = cfg->rt_release_mm;
 
     /* Against the backplate: the re-press rule below. The same line is
-     * what analog_deep_update tests for BOTH keys at once, but it reads
+     * what analog_latch_update tests for BOTH keys at once, but it reads
      * the depths itself - nothing about the pair is decided here. */
-    int bottomed = depth_mm >= cfg->travel_mm - cfg->bottom_out_mm;
+    int bottomed = depth_mm >= cfg->travel_mm - cfg->backplate_mm;
 
     if (cfg->rt_enabled && self->rt_extreme != 0.0f) {
         /* 2. Already engaged: rapid trigger owns this sample exclusively,
@@ -1341,11 +1319,11 @@ static int analog_key_feed(analog_state_t *st, int idx, float depth_mm,
         } else {
             /* Bottoming out always presses, however small the down-travel
              * since the last reversal - the mirror of rule 1, where a full
-             * release always releases however small the up-travel. Riding
+             * release always releases however small the up-travel. Resting on
              * the backplate as the neutral position depends on this: with a
              * large press distance, a stroke that ends against the bottom
              * never travels far enough to satisfy the reversal test on its
-             * own. (While RIDING this no longer applies at all - rule 0
+             * own. (While ARMED this no longer applies at all - rule 0
              * returns before any of this.) */
             /* A re-press still has to clear actuation_mm: without that
              * floor, a reversal entirely within the top fraction of travel
@@ -1497,9 +1475,9 @@ static int hid_map_from_any_keyboard(const char *input_dir,
     return found;
 }
 
-/* One analog-mode pair's machine: its two keys' front-ends, its SOCD state
- * and its `deep` latch. Everything the latch functions touch lives here, so
- * each pair arms, rides and disarms on its own two keys and nothing else -
+/* One analog pair: its two keys' front-ends, its state machine and its
+ * latch. Everything the latch functions touch lives here, so each pair
+ * arms, trills and disarms on its own two keys and nothing else -
  * the latch rule stays a two-key test however many pairs there are. `idx`
  * names the pair in cfg->pair[]; a memset one is pair 0, which is what the
  * tools rely on. */
@@ -1507,12 +1485,12 @@ typedef struct {
     int            idx;         /* which cfg->pair[] this is */
     uint16_t       usage[2];    /* HID usage id of k1, k2 */
     analog_state_t keys;
-    socd_state_t   socd;
-    int            deep;        /* 1 == both keys planted on the backplate;
-                                 * k1/k2 run the toggle instead of the
-                                 * plain remap. See analog_deep_update. */
+    machine_t      machine;
+    int            armed;       /* the latch: 1 == armed by a plant, k1/k2
+                                 * trill; 0 == independent. See
+                                 * analog_latch_update. */
     int            last_press;  /* 0 == k1, 1 == k2: most recent press edge.
-                                 * Picks which key keeps its virtual on when
+                                 * Picks which key stays down when
                                  * the latch arms with both already
                                  * down - last input wins. */
     int            plant_pending; /* both keys are on the backplate and the
@@ -1523,16 +1501,16 @@ typedef struct {
     float          plant_mm[2]; /* latch depths in the latest report while
                                  * the debounce runs - only for the ARMED
                                  * log line when the window expires between
-                                 * reports (analog_deep_tick) */
+                                 * reports (analog_latch_tick) */
     int            arm_on_report; /* REPLAY ONLY, never set by the daemon:
                                    * judge the debounce on reports alone, as
                                    * the daemon did before it had a timer.
-                                   * See analog_deep_tick. */
+                                   * See analog_latch_tick. */
 } analog_pair_t;
 
 /* An open analog interface plus the pairs it drives. One per daemon: the
  * board is one device whatever is mapped on it, and a second analog board
- * would only fight the first over the same virtual keys. Each report is read
+ * would only fight the first over the same keys. Each report is read
  * and decoded once here and handed to every pair. */
 typedef struct {
     int            kind;        /* EP_ANALOG */
@@ -1580,7 +1558,7 @@ static analog_dev_t *analog_dev_open(const oid_config_t *cfg,
     int             walked = 0;
     for (int i = 0; i < cfg->n_pairs; i++) {
         const keypair_t *pc = &cfg->pair[i];
-        if (only >= 0 ? i != only : pc->socd != SOCD_ANALOG)
+        if (only >= 0 ? i != only : pc->mode != MODE_ANALOG)
             continue;
         if ((pc->hid_k1 < 0 || pc->hid_k2 < 0) && !walked) {
             hid_map_from_any_keyboard(input_dir, usage_of_key);
@@ -1635,16 +1613,16 @@ static analog_dev_t *analog_dev_open(const oid_config_t *cfg,
              "(derived), backplate at %.2fmm, rapid trigger %s, latch "
              "debounce %.1fms",
              (double)cfg->analog.actuation_mm, (double)cfg->analog.release_mm,
-             (double)(cfg->analog.travel_mm - cfg->analog.bottom_out_mm),
+             (double)(cfg->analog.travel_mm - cfg->analog.backplate_mm),
              cfg->analog.rt_enabled ? "on" : "off",
              (double)cfg->analog.latch_debounce_ms);
-    LOG_INFO("SOCD engages while both keys are planted on the backplate "
-             "(deep latch); while engaged the backplate is the switch and "
-             "rapid trigger does not run; disengages when BOTH keys leave "
+    LOG_INFO("The latch arms on a plant (both keys on the backplate); "
+             "while armed the pair trills, the backplate is the switch and "
+             "rapid trigger does not run; it disarms when BOTH keys leave "
              "the backplate - one finger lifting is a stroke, not an exit");
     if (cfg->analog.rt_enabled) {
-        LOG_INFO("Rapid trigger (tapping only): press %.2fmm release %.2fmm"
-                 " - while riding, the backplate is the switch",
+        LOG_INFO("Rapid trigger (independent only): press %.2fmm "
+                 "release %.2fmm - while armed, the backplate is the switch",
                  (double)cfg->analog.rt_press_mm,
                  (double)cfg->analog.rt_release_mm);
     }
@@ -1689,7 +1667,7 @@ static void analog_dev_close(analog_dev_t *ad) {
  *
  * `# latch_arm=deadline` is the same idea for a rule instead of a number: it
  * says the daemon this binary is arms the latch when the debounce runs out on
- * the clock (analog_deep_tick). A trace WITHOUT the line was recorded before
+ * the clock (analog_latch_tick). A trace WITHOUT the line was recorded before
  * the timer existed, by a daemon that armed on the next report, and `replay`
  * reproduces it that way. It describes the binary, not the config, so it is
  * true of the session only while `-T` and the running daemon are the same
@@ -1730,10 +1708,10 @@ static int analog_trace(const oid_config_t *cfg, const char *config_path,
     const analog_config_t *a = &cfg->analog;
     printf("# analog travel_mm=%g actuation_mm=%g rapid_trigger.enabled=%d "
            "rapid_trigger.press_mm=%g rapid_trigger.release_mm=%g "
-           "rapid_trigger.bottom_out_mm=%g latch_debounce_ms=%g\n",
+           "backplate_mm=%g latch_debounce_ms=%g\n",
            (double)a->travel_mm, (double)a->actuation_mm, a->rt_enabled,
            (double)a->rt_press_mm, (double)a->rt_release_mm,
-           (double)a->bottom_out_mm, (double)a->latch_debounce_ms);
+           (double)a->backplate_mm, (double)a->latch_debounce_ms);
     printf("# latch_arm=deadline\n");
     printf("us,k1_mm,k2_mm\n");
     fflush(stdout);
@@ -1968,24 +1946,24 @@ static void destroy_virtual(void) {
  *     2 = SINGLE   first key pressed (zero -> one)
  *     3 = PRESS    one key held -> second pressed (one -> two)
  *
- * RELEASE depends on cfg->socd: SOCD_TOGGLE reverts to the other key no
- * matter which of the two was released (latching), SOCD_SNAPPY ("last
+ * RELEASE depends on cfg->mode: MODE_TRILL reverts to the other key no
+ * matter which of the two was released (latching), MODE_LAST ("last
  * input wins") only falls through to the still-held key when the active
- * key is the one released. SOCD_OFF skips the state machine entirely:
+ * key is the one released. MODE_INDEPENDENT skips the state machine entirely:
  * each key passes through one-to-one, nothing else.
  */
 enum { S_NONE = 0, S_RELEASE = 1, S_SINGLE = 2, S_PRESS = 3 };
 
-/* The SOCD core. Takes a synthesized (is_k1, value) edge rather than a raw
+/* The state machine. Takes a synthesized (is_k1, value) edge rather than a raw
  * evdev event so that both the evdev path and the analog path can drive it:
  * process_event() below feeds it real key events, analog_drive() feeds it
  * edges derived from travel depth. The transition logic is identical either
  * way, which is the point. */
-static void socd_apply(socd_state_t *in, int is_k1, int value, int mode,
-                       const keypair_t *cfg) {
+static void machine_apply(machine_t *in, int is_k1, int value, int mode,
+                          const keypair_t *cfg) {
     in->mode = mode;
 
-    if (mode == SOCD_OFF) {
+    if (mode == MODE_INDEPENDENT) {
         /* k1/k2 still tracked so release_stuck can clean up a dying device. */
         if (value != 2) {
             if (is_k1) in->k1 = value;
@@ -2014,10 +1992,10 @@ static void socd_apply(socd_state_t *in, int is_k1, int value, int mode,
         break;
         }
         case S_RELEASE:
-        /* Snappy mode: releasing the non-active (already suppressed) key
+        /* Last: releasing the non-active (already suppressed) key
          * changes nothing; only the active key's release falls through to
-         * the still-held one. Toggle mode reverts on either release. */
-        if (mode == SOCD_SNAPPY && is_k1 != in->act)
+         * the still-held one. Trill falls back on either release. */
+        if (mode == MODE_LAST && is_k1 != in->act)
             break;
         /* fallthrough */
         case S_PRESS: {
@@ -2054,7 +2032,7 @@ static int pair_of_key(const oid_config_t *cfg, unsigned code, int *is_k1) {
 }
 
 /* evdev entry point: mirror everything that isn't a pair key, and hand pair
- * keys to that pair's SOCD core. On the analog board, an analog-mode pair is
+ * keys to that pair's state machine. On the analog board, an analog-mode pair is
  * driven from travel depth instead, so its digital copies are dropped here to
  * avoid emitting each press twice - but ONLY that pair's: a digital-mode pair
  * on the same board has nobody else to drive it. */
@@ -2070,11 +2048,11 @@ static void process_event(input_dev_t *in, const struct input_event *ie,
         return;
     }
 
-    if (in->analog && cfg->pair[p].socd == SOCD_ANALOG)
+    if (in->analog && cfg->pair[p].mode == MODE_ANALOG)
         return;
 
-    socd_apply(&in->socd[p], is_k1, ie->value, cfg->pair[p].socd,
-               &cfg->pair[p]);
+    machine_apply(&in->machine[p], is_k1, ie->value, cfg->pair[p].mode,
+                  &cfg->pair[p]);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -2119,15 +2097,15 @@ static int drain_device(input_dev_t *in, const oid_config_t *cfg) {
     return 0;
 }
 
-/* Which virtual keys `mode` would be holding down, given which physical
- * keys `held` says are down. SOCD_OFF mirrors one-to-one; the toggle holds
- * exactly one - the `act` one - whenever anything at all is held. Used to
- * diff the two modes against each other when the `deep` latch changes
- * under held fingers. */
-static void socd_virtual_state(const int *held, int act, int mode,
-                               int *down) {
+/* Which keys `mode` would be holding down on the virtual keyboard, given
+ * which physical keys `held` says are down. MODE_INDEPENDENT mirrors
+ * one-to-one; the trill holds exactly one - the `act` one - whenever
+ * anything at all is held. Used to diff the two against each other when the
+ * latch changes under held fingers. */
+static void machine_outputs(const int *held, int act, int mode,
+                            int *down) {
     down[0] = down[1] = 0;
-    if (mode == SOCD_OFF) {
+    if (mode == MODE_INDEPENDENT) {
         down[0] = held[0];
         down[1] = held[1];
     } else if (held[0] || held[1]) {
@@ -2135,84 +2113,68 @@ static void socd_virtual_state(const int *held, int act, int mode,
     }
 }
 
-/* Arm or disarm the `deep` latch, reconciling the virtual keys as we go.
+/* Arm or disarm the latch, reconciling the virtual keyboard as we go.
  *
- * The two modes disagree about what should be held: OFF wants a virtual key
- * per held physical key, the toggle wants exactly one. Flipping the flag
- * without settling that difference is what strands a key - the toggle can
+ * The two rules disagree about what should be held: independent wants a key
+ * down per held physical key, the trill wants exactly one. Flipping the flag
+ * without settling that difference is what strands a key - the trill can
  * legitimately leave `act` on a finger that has already lifted, and a later
- * release routed through OFF writes only its own code, so whatever the
- * toggle pressed is never released. So compute both pictures and emit the
+ * release routed through independent writes only its own code, so whatever
+ * the trill pressed is never released. So compute both pictures and emit the
  * difference.
  *
- * That matters MORE than it did when the latch cleared at release_mm:
- * disarming at actuation_mm means the mode can flip with a finger still
- * resting well down on a key, so a mode change under held fingers is
- * routine rather than a corner.
- *
  * Arming with both keys already down - which is always, since arming means
- * both are on the floor and the plain remap has pressed both - means one of
- * them has to let go. The most recently pressed key keeps it: last input
- * wins, the same principle the core runs on. Which one keeps it does NOT
- * decide `act`; see analog_socd_edge. */
-static void analog_deep_set(analog_pair_t *ad, int on,
+ * both are on the backplate and independent has pressed both - means one of
+ * them has to let go. The most recently pressed key keeps it: the newest
+ * stroke wins, the same principle last runs on. Which one keeps it does NOT
+ * decide `act`; see analog_machine_edge. */
+static void analog_latch_set(analog_pair_t *ad, int on,
                             const oid_config_t *cfg) {
-    /* Where the virtual keys stand comes from socd, which reflects the
+    /* Where the keys stand comes from the machine, which reflects the
      * edges already APPLIED. Where they should end up comes from the
-     * front-end's `live`, which is this sample's truth - socd still lags it
-     * by whatever edges have not been routed yet. Targeting socd instead
+     * front-end's `live`, which is this report's truth - the machine still
+     * lags it by whatever edges have not been routed yet. Targeting it
      * would press a key for a finger that left on this very sample, then
      * release it again when the edge lands: a phantom note on the way out
      * of a rock. */
     const keypair_t *pc = &cfg->pair[ad->idx];
-    int cur[2]  = { ad->socd.k1, ad->socd.k2 };
+    int cur[2]  = { ad->machine.k1, ad->machine.k2 };
     int next[2] = { ad->keys.key[0].live, ad->keys.key[1].live };
     int from[2], to[2];
 
-    socd_virtual_state(cur, ad->socd.act,
-                       ad->deep ? pc->socd : SOCD_OFF, from);
+    machine_outputs(cur, ad->machine.act,
+                    ad->armed ? pc->mode : MODE_INDEPENDENT, from);
 
     if (on) {
         int keep = ad->last_press;
         if (!next[keep]) keep = !keep;      /* it lifted; the other has it */
-        ad->socd.act = (keep == 0);
+        ad->machine.act = (keep == 0);
     } else {
         /* PARK both front ends on the way out. Disarming means neither key
-         * is on the floor, so nothing is held - but a key can still be well
-         * down (it need only have left the backplate), and the tapping
-         * profile is about to judge it against actuation_mm instead.
+         * is on the backplate, so nothing is held - but a key can still be
+         * well down (it need only have left the backplate), and the
+         * independent rules are about to judge it against actuation_mm.
          *
          * Clearing `live` alone would let rule 3 read that depth as a FRESH
          * actuation and press a finger that is on its way up - a phantom
          * note landing exactly where a slider ends. Leaving `live` set is no
          * better: its eventual release emits an up with no matching down,
-         * and socd_apply assumes strict alternation per key.
+         * and machine_apply assumes strict alternation per key.
          *
          * `live = 0` with `rt_extreme` still holding the current depth is
          * neither: it is rule 2's "engaged but not live" state, where the
          * key tracks its extreme on the way up, emits nothing, and re-presses
          * only on a real stroke - a bottom-out, or press_mm of down-travel.
-         * analog_key_feed's riding branch leaves rt_extreme parked for
+         * analog_key_feed's armed branch leaves rt_extreme parked for
          * exactly this handoff. */
         for (int k = 0; k < 2; k++)
             ad->keys.key[k].live = 0;
         next[0] = next[1] = 0;
     }
-    ad->deep = on;
-    socd_virtual_state(next, ad->socd.act, on ? pc->socd : SOCD_OFF, to);
+    ad->armed = on;
+    machine_outputs(next, ad->machine.act, on ? pc->mode : MODE_INDEPENDENT, to);
 
-    /* Emit the difference. BOTH directions are release-only now, which is
-     * what the new disarm rule buys:
-     *
-     * ARMING goes from OFF's two keys down to the toggle's one. Planting is
-     * not a note, and both keys already pressed under OFF on their way down.
-     *
-     * DISARMING goes from the toggle's one to none. The old rule could fire
-     * with the other finger still planted deep, so it had to PRESS to avoid
-     * stranding that hold - at the cost of a second note for one lift. Under
-     * "both off the floor" there is by definition nobody still riding, so
-     * there is no survivor to strand and nothing to press. The parked front
-     * ends above pick the keys back up on their next real stroke. */
+    /* Emit the difference. */
     for (int k = 0; k < 2; k++) {
         if (from[k] == to[k]) continue;
         libevdev_uinput_write_event(uidev, EV_KEY,
@@ -2239,12 +2201,12 @@ static uint64_t analog_debounce_ns(const analog_config_t *a) {
 
 /* When a running latch debounce runs out, or 0 if none is running (no
  * plant pending, already armed, or the debounce is off and so never waits).
- * The daemon arms a timerfd on this; see analog_deep_tick. */
-static int analog_deep_deadline(const analog_pair_t *ad, const oid_config_t *cfg,
+ * The daemon arms a timerfd on this; see analog_latch_tick. */
+static int analog_latch_deadline(const analog_pair_t *ad, const oid_config_t *cfg,
                                 uint64_t *deadline_ns) {
     if (ad->arm_on_report)
         return 0;
-    if (ad->deep || !ad->plant_pending || cfg->analog.latch_debounce_ms <= 0.0f)
+    if (ad->armed || !ad->plant_pending || cfg->analog.latch_debounce_ms <= 0.0f)
         return 0;
     *deadline_ns = ad->plant_ns + analog_debounce_ns(&cfg->analog);
     return 1;
@@ -2252,10 +2214,10 @@ static int analog_deep_deadline(const analog_pair_t *ad, const oid_config_t *cfg
 
 /* Arm the latch if the debounce has run out at `t_ns`. Shared by the
  * per-report test and the timer, so both arm identically. */
-static void analog_deep_try_arm(analog_pair_t *ad, const oid_config_t *cfg,
+static void analog_latch_try_arm(analog_pair_t *ad, const oid_config_t *cfg,
                                 uint64_t t_ns) {
     const analog_config_t *a = &cfg->analog;
-    if (ad->deep || !ad->plant_pending)
+    if (ad->armed || !ad->plant_pending)
         return;
     if (t_ns - ad->plant_ns < analog_debounce_ns(a))
         return;
@@ -2265,14 +2227,14 @@ static void analog_deep_try_arm(analog_pair_t *ad, const oid_config_t *cfg,
      * reverts through two writes the kernel drops. With no trace of it
      * anywhere, a latch that never arms and a latch that arms and works
      * look identical from outside - which is exactly the question you
-     * are asking when the daemon seems stuck on the plain remap.
+     * are asking when the pair seems stuck independent.
      * Transitions are once per rock, not per report. */
-    LOG_INFO("%sDeep latch ARMED: k1 %.2fmm, k2 %.2fmm both at or past "
-             "the backplate (%.2fmm) for %.1fms - SOCD toggle engaged",
+    LOG_INFO("%sLatch ARMED: k1 %.2fmm, k2 %.2fmm both at or past "
+             "the backplate (%.2fmm) for %.1fms - trilling",
              pair_tag(cfg, ad->idx), (double)ad->plant_mm[0], (double)ad->plant_mm[1],
-             (double)(a->travel_mm - a->bottom_out_mm),
+             (double)(a->travel_mm - a->backplate_mm),
              (double)(t_ns - ad->plant_ns) / 1e6);
-    analog_deep_set(ad, 1, cfg);
+    analog_latch_set(ad, 1, cfg);
 }
 
 /* The debounce window, judged on the clock rather than on the next report.
@@ -2280,76 +2242,66 @@ static void analog_deep_try_arm(analog_pair_t *ad, const oid_config_t *cfg,
  * The board reports on CHANGE, so two planted, still fingers send nothing at
  * all. Judging the window only when a report arrived meant a rock that
  * planted and held never armed until something moved - and if the thing that
- * moved was the first lift of the rock, one key was already off the floor,
+ * moved was the first lift of the rock, one key was already off the backplate,
  * the pending plant was cancelled, and the latch never armed for that rock.
  * Measured on a user journal at 30ms: mean arm delay 68.6ms, 5% within 5ms of
  * the setting, plus every rock that silently never armed (issue #12).
  *
  * `plant_pending` can only be standing here if the latest report had both
- * keys on the floor, and any movement off it would itself have been a report,
+ * keys on the backplate, and any movement off it would itself have been a report,
  * so "no report since" means "still planted". The daemon calls this from a
  * timerfd at the deadline; analog_report also calls it with the report's own
  * time before feeding, so a report that lands after a window the timer has
  * not yet been serviced for - or the tools, which have no timer - arm first
- * and then run the report under the toggle, exactly as the daemon would have.
- * Nothing is emitted here except what analog_deep_set reconciles.
+ * and then run the report armed, exactly as the daemon would have.
+ * Nothing is emitted here except what analog_latch_set reconciles.
  *
  * `arm_on_report` turns all of this off, and exists for one caller: replay,
  * on a trace recorded by a daemon that had no timer. That daemon judged the
- * window only inside analog_deep_update, so a still plant armed on the next
+ * window only inside analog_latch_update, so a still plant armed on the next
  * report and a rock whose next report was its first lift never armed at all.
- * That was the defect - but it is also what the player's virtual keys DID in
+ * That was the defect - but it is also what the virtual keyboard DID in
  * those sessions, and replaying them under this rule instead moves every arm
  * earlier and adds latches that never happened. A `-T` trace says which rule
  * it was played under (`# latch_arm=deadline`, see analog_trace); one that
  * does not say predates the timer. Both callers come through here, and
- * analog_deep_deadline reports nothing to wait for, so the flag is the whole
- * of the old behaviour - analog_deep_update is the same code either way. */
-static void analog_deep_tick(analog_pair_t *ad, const oid_config_t *cfg,
+ * analog_latch_deadline reports nothing to wait for, so the flag is the whole
+ * of the old behaviour - analog_latch_update is the same code either way. */
+static void analog_latch_tick(analog_pair_t *ad, const oid_config_t *cfg,
                              uint64_t t_ns) {
     if (ad->arm_on_report)
         return;
-    analog_deep_try_arm(ad, cfg, t_ns);
+    analog_latch_try_arm(ad, cfg, t_ns);
 }
 
-/* Resolve the `deep` latch for this sample, before the sample's edges are
+/* Resolve the latch for this report, before the report's edges are
  * applied.
  *
  * This is the whole discriminator between the two play patterns, and both
  * halves are pure depth tests on the CURRENT frame - no per-key latch, no
  * comparison of one key's depth against the other's. That last point is not
  * an accident: every abandoned version of this feature gated on relative
- * depth, trying to decide whether a shallow press "deserved" to steal from a
- * deep one, and that is not a problem that exists. Do not reintroduce it.
+ * depth, trying to decide whether a shallow stroke "deserved" to steal from
+ * a deeper one, and that is not a problem that exists. Do not reintroduce it.
  *
  * Deciding before the edges is what stops the lift that ends a rock from
- * being reverted by a toggle on its way out: the release then lands as a
- * plain release, over virtual keys the reconciliation has already put where
- * SOCD_OFF expects them. */
-static void analog_deep_update(analog_pair_t *ad, const oid_config_t *cfg,
+ * answered with a fallback on its way out: the release then lands as a
+ * plain release, over keys the reconciliation has already put where
+ * MODE_INDEPENDENT expects them. */
+static void analog_latch_update(analog_pair_t *ad, const oid_config_t *cfg,
                                const float *depth, uint64_t t_ns) {
     const analog_config_t *a = &cfg->analog;
 
-    float floor_mm = a->travel_mm - a->bottom_out_mm;
+    float backplate_depth = a->travel_mm - a->backplate_mm;
 
-    if (ad->deep) {
+    if (ad->armed) {
         ad->plant_pending = 0;
-        /* BOTH fingers off the floor ends it. One key leaving is a stroke,
-         * not an exit - which is the whole point, and why the earlier rule
-         * (either key back past actuation_mm) was wrong. In a burst a finger
-         * routinely lifts clear of the switch while the other stays planted;
-         * that tore the latch down mid-gesture, and the next note then fired
-         * off the tapping profile at actuation instead of at the backplate.
-         * Measured on tests/toggle_5burst_3phys_5virt.csv: k2 sat at 3.5000
-         * throughout while k1 lifted to 0.0000, and note 4 landed 11.9ms
-         * early at 0.25mm instead of at 3.44mm. Two thresholds inside one
-         * burst is jitter, and "how completely you lift" is exactly the kind
-         * of amplitude-driven rule this design already rejects elsewhere. */
-        if (depth[0] < floor_mm && depth[1] < floor_mm) {
-            LOG_INFO("%sDeep latch cleared: k1 %.2fmm, k2 %.2fmm - both off "
-                     "the backplate (%.2fmm), back to the plain remap",
-                     pair_tag(cfg, ad->idx), (double)depth[0], (double)depth[1], (double)floor_mm);
-            analog_deep_set(ad, 0, cfg);
+        /* BOTH fingers off the backplate ends it. */
+        if (depth[0] < backplate_depth && depth[1] < backplate_depth) {
+            LOG_INFO("%sLatch disarmed: k1 %.2fmm, k2 %.2fmm - both off "
+                     "the backplate (%.2fmm), independent again",
+                     pair_tag(cfg, ad->idx), (double)depth[0], (double)depth[1], (double)backplate_depth);
+            analog_latch_set(ad, 0, cfg);
         }
         return;
     }
@@ -2357,7 +2309,7 @@ static void analog_deep_update(analog_pair_t *ad, const oid_config_t *cfg,
     /* Both against the backplate in ONE sample.
      *
      * Alt-tapping cannot satisfy this. Its defining shape is one finger
-     * leaving as the other arrives, so the two are never both on the floor
+     * leaving as the other arrives, so the two are never both on the backplate
      * together, however fast it is played and however much the presses
      * overlap in the middle of travel. Rocking, by contrast, BEGINS by
      * planting both - you cannot start one any other way. That asymmetry is
@@ -2368,14 +2320,14 @@ static void analog_deep_update(analog_pair_t *ad, const oid_config_t *cfg,
      *
      * Hysteresis is enormous by construction, so there is no chatter to
      * debounce in the usual sense. What `latch_debounce_ms` filters is a
-     * different thing: two hard taps that BOTH happen to touch the floor in
-     * the same report, which is an instant, against a rock, which plants
-     * and stays. It wraps this test and nothing else - the depths are still
-     * judged on the current sample alone, nothing is compared across keys,
-     * and while it runs the pair stays on the plain remap, so the cost of a
-     * debounce is that the toggle engages that much later, never a phantom
-     * note. Either key leaving the floor restarts it. */
-    if (depth[0] < floor_mm || depth[1] < floor_mm) {
+     * different thing: a 2B or two hard alt-taps that BOTH happen to touch
+     * the backplate in the same report, which is an instant, against a rock,
+     * which plants and stays. It wraps this test and nothing else - the
+     * depths are still judged on the current sample alone, nothing is
+     * compared across keys, and while it runs the pair stays independent,
+     * so the cost of a debounce is that the trill engages that much later,
+     * never a phantom note. Either key leaving the backplate restarts it. */
+    if (depth[0] < backplate_depth || depth[1] < backplate_depth) {
         ad->plant_pending = 0;
         return;
     }
@@ -2385,42 +2337,31 @@ static void analog_deep_update(analog_pair_t *ad, const oid_config_t *cfg,
     }
     ad->plant_mm[0] = depth[0];
     ad->plant_mm[1] = depth[1];
-    analog_deep_try_arm(ad, cfg, t_ns);
+    analog_latch_try_arm(ad, cfg, t_ns);
 }
 
-/* Route one synthesized edge into the SOCD core under whatever mode the
- * `deep` latch selects. The latch itself is resolved once per sample in
+/* Route one synthesized edge into the state machine under whatever rule
+ * the latch selects. The latch itself is resolved once per sample in
  * analog_drain, before any of that sample's edges are applied. */
-static void analog_socd_edge(analog_pair_t *ad, int is_k1, int value,
-                             const oid_config_t *cfg) {
-    /* cfg->socd is SOCD_ANALOG here; socd_apply special-cases only OFF and
-     * SNAPPY, so ANALOG runs the toggle path. Deliberate, not accidental. */
+static void analog_machine_edge(analog_pair_t *ad, int is_k1, int value,
+                                const oid_config_t *cfg) {
+    /* cfg->mode is MODE_ANALOG here; machine_apply special-cases only
+     * INDEPENDENT and LAST, so ANALOG runs the trill. Deliberate, not
+     * accidental. */
     const keypair_t *pc = &cfg->pair[ad->idx];
-    int mode = ad->deep ? pc->socd : SOCD_OFF;
+    int mode = ad->armed ? pc->mode : MODE_INDEPENDENT;
 
-    /* `act` needs no lazy binding any more, and that is a consequence of the
-     * backplate rule rather than a separate fix.
-     *
-     * The old design had to defer it: arming released one virtual, and if the
-     * key that then dipped was the OTHER one, `act` named a key whose virtual
-     * was already up - so the handover wrote up(already-up) + down(already-
-     * down) and the kernel ate both. Deferring the binding to the first dip
-     * answered "which finger is leaving", but it made `act` lie about which
-     * virtual was down, which is what cost the note.
-     *
-     * Now arming leaves the picture in the toggle's canonical form - exactly
-     * one virtual down, and `act` names it truthfully - and every later edge
+     /* Arming leaves the picture in the trill's canonical form - exactly
+     * one key down, and `act` names it truthfully - and every later edge
      * is a plain backplate crossing. up(act) is always a real release and
-     * down(!act) always a real press, whichever finger moves. So the choice
-     * at arming is genuinely arbitrary, `act_bound` is gone, and so is the
-     * cycle that used to repair the no-op. */
+     * down(!act) always a real press, whichever finger moves. */
     if (value == 1)
         ad->last_press = is_k1 ? 0 : 1;
 
-    socd_apply(&ad->socd, is_k1, value, mode, pc);
+    machine_apply(&ad->machine, is_k1, value, mode, pc);
 }
 
-/* Turn ONE report's worth of depths into SOCD edges. Split out of
+/* Turn ONE report's worth of depths into edges. Split out of
  * analog_drain so that tools/replay.c and tools/regimetest.c drive this
  * exact function instead of reimplementing the ordering - the latch
  * resolution and the edge routing have to happen in this order, and a copy
@@ -2429,31 +2370,31 @@ static void analog_socd_edge(analog_pair_t *ad, int is_k1, int value,
 static void analog_report(analog_pair_t *ad, const oid_config_t *cfg,
                           const float *depth, uint64_t t_ns) {
     /* Feed both keys before judging either: engagement and lapse read the
-     * deep/live state of BOTH, which is only complete once both have been
+     * depth/live state of BOTH, which is only complete once both have been
      * fed. The latch is then resolved BEFORE this sample's edges are
      * applied, so every edge runs under the mode actually in force for it.
      * That ordering is what stops the lift ending a rock from being
-     * reverted by a toggle on its way out - the release lands as a plain
-     * release, and the reconciliation in analog_deep_set has already put
-     * the virtual keys where OFF expects them. */
+     * answered with a fallback on its way out - the release lands as a
+     * plain release, and the reconciliation in analog_latch_set has already
+     * put the keys where independent expects them. */
     /* A debounce that ran out since the last report arms first, as of now,
      * so this report is judged under the mode that was already in force for
-     * it. See analog_deep_tick. */
-    analog_deep_tick(ad, cfg, t_ns);
+     * it. See analog_latch_tick. */
+    analog_latch_tick(ad, cfg, t_ns);
 
     int edges[2][2], ne[2];
     for (int k = 0; k < 2; k++)
         ne[k] = analog_key_feed(&ad->keys, k, depth[k], &cfg->analog,
-                                ad->deep, edges[k]);
+                                ad->armed, edges[k]);
 
-    analog_deep_update(ad, cfg, depth, t_ns);
+    analog_latch_update(ad, cfg, depth, t_ns);
 
     for (int k = 0; k < 2; k++)
         for (int e = 0; e < ne[k]; e++)
-            analog_socd_edge(ad, k == 0, edges[k][e], cfg);
+            analog_machine_edge(ad, k == 0, edges[k][e], cfg);
 }
 
-/* Read every queued analog report and turn travel depth into SOCD edges.
+/* Read every queued analog report and turn travel depth into edges.
  * A key absent from a report is at rest, so each frame is a complete
  * picture rather than a delta: resolve the current depth of k1/k2, feed
  * both to the front-end, and route whatever edges come back through the
@@ -2472,7 +2413,7 @@ static int analog_drain(analog_dev_t *ad, const oid_config_t *cfg) {
             return -1;
 
         /* hidraw carries no timestamp, so the report is stamped on arrival
-         * - the latch debounce in analog_deep_update is judged on these.
+         * - the latch debounce in analog_latch_update is judged on these.
          * One vDSO read on a path that already syscalls per report. */
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
@@ -2484,7 +2425,7 @@ static int analog_drain(analog_dev_t *ad, const oid_config_t *cfg) {
                                            ANALOG_SLOTS);
 
         /* One report, every pair - in pair order, each on its own two
-         * keys. Pairs share no keys and no virtuals, so the order between
+         * keys. Pairs share no keys, so the order between
          * them decides nothing but the order of writes within a report. */
         for (int p = 0; p < ad->n_pairs; p++) {
             analog_pair_t *ap = &ad->pair[p];
@@ -2506,7 +2447,7 @@ static int analog_dev_deadline(const analog_dev_t *ad, const oid_config_t *cfg,
     int any = 0;
     for (int p = 0; p < ad->n_pairs; p++) {
         uint64_t dl;
-        if (analog_deep_deadline(&ad->pair[p], cfg, &dl) &&
+        if (analog_latch_deadline(&ad->pair[p], cfg, &dl) &&
             (!any || dl < *deadline_ns)) {
             *deadline_ns = dl;
             any = 1;
@@ -2520,16 +2461,16 @@ static int analog_dev_deadline(const analog_dev_t *ad, const oid_config_t *cfg,
 static void analog_dev_tick(analog_dev_t *ad, const oid_config_t *cfg,
                             uint64_t t_ns) {
     for (int p = 0; p < ad->n_pairs; p++)
-        analog_deep_tick(&ad->pair[p], cfg, t_ns);
+        analog_latch_tick(&ad->pair[p], cfg, t_ns);
 }
 
-/* A device that dies while it holds k1/k2 would leave its active virtual
- * key stuck down forever; release it before dropping the device. */
-static void release_stuck(socd_state_t *in, const keypair_t *cfg) {
+/* A device that dies while it holds k1/k2 would leave its active key
+ * stuck down forever; release it before dropping the device. */
+static void release_stuck(machine_t *in, const keypair_t *cfg) {
     if (!(in->k1 || in->k2))
         return;
-    if (in->mode == SOCD_OFF) {
-        /* no active-key tracking in off mode; both may be down */
+    if (in->mode == MODE_INDEPENDENT) {
+        /* no active key while independent; both may be down */
         if (in->k1) {
             libevdev_uinput_write_event(uidev, EV_KEY, cfg->k1, 0);
             libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
@@ -2551,7 +2492,7 @@ static void release_stuck(socd_state_t *in, const keypair_t *cfg) {
  * dying - but it used to be PERMANENT: the evdev node returns through the
  * inotify reconcile while nothing ever retried the hidraw one, so a replug,
  * a USB glitch or a suspend left the daemon quietly running the digital
- * toggle under an analog config until someone restarted it. Silent, and
+ * trill under an analog config until someone restarted it. Silent, and
  * indistinguishable from the state machine misbehaving.
  *
  * Nothing watches /sys/class/hidraw, so the evdev node coming back is the
@@ -2595,7 +2536,7 @@ static void analog_reconcile(analog_dev_t **ad, analog_dev_t **adp,
  * or disarm it. Called after anything that can start, restart or end the
  * window: every analog drain, every timer expiry, and the device going
  * away. The deadline is on CLOCK_MONOTONIC, the clock analog_drain stamps
- * reports with, so the window measured here is the one analog_deep_update
+ * reports with, so the window measured here is the one analog_latch_update
  * started. */
 static void latch_timer_sync(int tfd, const analog_dev_t *ad,
                              const oid_config_t *cfg) {
@@ -2729,7 +2670,7 @@ static int run_loop(dev_list_t *devs, const oid_config_t *cfg,
                     LOG_WARN("analog device %s gone; falling back to the "
                              "digital path", ad->path);
                     for (int p = 0; p < ad->n_pairs; p++)
-                        release_stuck(&ad->pair[p].socd,
+                        release_stuck(&ad->pair[p].machine,
                                       &cfg->pair[ad->pair[p].idx]);
                     epoll_ctl(epfd, EPOLL_CTL_DEL, ad->fd, NULL);
                     g_analog_vid = g_analog_pid = 0;
@@ -2756,7 +2697,7 @@ static int run_loop(dev_list_t *devs, const oid_config_t *cfg,
 
             if (dead) {
                 for (int p = 0; p < cfg->n_pairs; p++)
-                    release_stuck(&in->socd[p], &cfg->pair[p]);
+                    release_stuck(&in->machine[p], &cfg->pair[p]);
                 epoll_ctl(epfd, EPOLL_CTL_DEL, in->fd, NULL);
                 dev_list_remove(devs, in);
                 input_close(in);
@@ -2905,7 +2846,7 @@ main(int argc, char **argv) {
         const char *k2n = libevdev_event_code_get_name(EV_KEY, pc->k2);
         LOG_INFO("  %skeys %s(%d) %s(%d), mode %s", pair_tag(&cfg, i),
                  k1n ? k1n : "?", pc->k1, k2n ? k2n : "?", pc->k2,
-                 mode_name(pc->socd));
+                 mode_name(pc->mode));
     }
 
 	/* use rt scheduler if we can */

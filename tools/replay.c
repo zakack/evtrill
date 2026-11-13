@@ -12,10 +12,10 @@
  * reimplementation that could drift from it.
  *
  * The question it exists to answer: does ordinary alt-tapping ever arm the
- * `deep` latch? Arming needs BOTH keys on the backplate in one report, and
+ * latch? Arming needs BOTH keys on the backplate in one report, and
  * alt-tapping's defining shape is one finger leaving as the other arrives -
  * so in principle it never can. In practice that depends on how hard the
- * trace's author bottoms out and how wide `bottom_out_mm` is, which is a
+ * trace's author bottoms out and how wide `backplate_mm` is, which is a
  * matter of finger timing and travel depth rather than of hitting any
  * notes: a trace recorded against a metronome answers it as well as one
  * from a map. An alt-tap trace that reports ZERO latches is the acceptance
@@ -38,9 +38,9 @@
  * follows the trace. Anything else is a question about the daemon as it
  * stands, so it gets today's rule. -a overrides either way.
  *
- * -e FILE also writes the session as the virtual device saw it: every key
+ * -e FILE also writes the session as the virtual keyboard saw it: every key
  * transition a reader of the uinput node would have received, and every
- * time the `deep` latch armed or disarmed, one per line. `-e -` puts that on
+ * time the latch armed or disarmed, one per line. `-e -` puts that on
  * stdout and moves the human report to stderr.
  *
  *   build:  cmake --build build --target replay
@@ -85,18 +85,23 @@ typedef struct {
     int      arm_deadline;
 } trace_t;
 
-static const struct { const char *key; size_t off; int is_int; } rec_keys[] = {
-    { "travel_mm",                   offsetof(analog_config_t, travel_mm),     0 },
-    { "actuation_mm",                offsetof(analog_config_t, actuation_mm),  0 },
-    { "rapid_trigger.enabled",       offsetof(analog_config_t, rt_enabled),    1 },
-    { "rapid_trigger.press_mm",      offsetof(analog_config_t, rt_press_mm),   0 },
-    { "rapid_trigger.release_mm",    offsetof(analog_config_t, rt_release_mm), 0 },
-    { "rapid_trigger.bottom_out_mm", offsetof(analog_config_t, bottom_out_mm), 0 },
+/* `alias` is the name a field went by in older traces: bottom_out_mm sat
+ * under rapid_trigger until it was renamed for the backplate it defines. */
+static const struct {
+    const char *key; size_t off; int is_int; const char *alias;
+} rec_keys[] = {
+    { "travel_mm",                   offsetof(analog_config_t, travel_mm),     0, NULL },
+    { "actuation_mm",                offsetof(analog_config_t, actuation_mm),  0, NULL },
+    { "rapid_trigger.enabled",       offsetof(analog_config_t, rt_enabled),    1, NULL },
+    { "rapid_trigger.press_mm",      offsetof(analog_config_t, rt_press_mm),   0, NULL },
+    { "rapid_trigger.release_mm",    offsetof(analog_config_t, rt_release_mm), 0, NULL },
+    { "backplate_mm",                offsetof(analog_config_t, backplate_mm),  0,
+      "rapid_trigger.bottom_out_mm" },
     /* Added after the `# analog` line was. Everything below REC_REQUIRED is
      * OPTIONAL: a trace recorded before the field existed played under its
      * default, so absence is a known value rather than a gap, and treating
      * it as one would discard every older trace's recorded thresholds. */
-    { "latch_debounce_ms",           offsetof(analog_config_t, latch_debounce_ms), 0 },
+    { "latch_debounce_ms",           offsetof(analog_config_t, latch_debounce_ms), 0, NULL },
 };
 #define N_REC_KEYS   (sizeof(rec_keys) / sizeof(rec_keys[0]))
 #define REC_REQUIRED ((1 << 6) - 1)
@@ -111,7 +116,9 @@ static void trace_parse_analog(char *line, trace_t *tr) {
         if (!eq) continue;
         *eq = '\0';
         for (size_t i = 0; i < N_REC_KEYS; i++) {
-            if (strcmp(tok, rec_keys[i].key)) continue;
+            if (strcmp(tok, rec_keys[i].key) &&
+                (!rec_keys[i].alias || strcmp(tok, rec_keys[i].alias)))
+                continue;
             char *field = (char *)&tr->rec + rec_keys[i].off;
             if (rec_keys[i].is_int)
                 *(int *)field = atoi(eq + 1);
@@ -176,10 +183,10 @@ static int trace_load(const char *path, trace_t *tr) {
 /* ------------------------------------------------------------------------ */
 
 typedef struct {
-    unsigned  engagements;
-    unsigned  presses;          /* virtual key-downs the kernel passes on */
+    unsigned  arms;
+    unsigned  notes;            /* key-downs the kernel passes on */
     unsigned  dropped;          /* no-change writes the kernel swallows */
-    long long first_engage_us;
+    long long first_arm_us;
 } run_t;
 
 static run_t      g_run;
@@ -193,21 +200,21 @@ static int        g_arm_on_report;
  * passes are hypotheticals rather than the session. */
 static FILE               *g_events;
 static const analog_pair_t *g_ad;         /* the pass in progress */
-static int                 g_logged_deep;
+static int                 g_logged_armed;
 static long long           g_origin_us;   /* the trace's first report */
 
-/* Log the latch if it moved since the last row. analog_deep_set flips
- * `deep` BEFORE it writes the reconciling releases, so calling this ahead of
+/* Log the latch if it moved since the last row. analog_latch_set flips
+ * `armed` BEFORE it writes the reconciling releases, so calling this ahead of
  * each write puts the latch row first - the releases are its consequence and
  * read that way. It runs again after every report for a flip that wrote
  * nothing. Hooked here rather than in evtrill.c: the field is the truth,
  * and the daemon needs no knowledge of this tool. */
-static void events_deep_sync(void) {
-    if (!g_events || !g_ad || g_ad->deep == g_logged_deep)
+static void events_latch_sync(void) {
+    if (!g_events || !g_ad || g_ad->armed == g_logged_armed)
         return;
-    g_logged_deep = g_ad->deep;
-    fprintf(g_events, "%lld,deep,%d\n", g_now_us - g_origin_us,
-            g_logged_deep);
+    g_logged_armed = g_ad->armed;
+    fprintf(g_events, "%lld,armed,%d\n", g_now_us - g_origin_us,
+            g_logged_armed);
 }
 
 /* The virtual keyboard as the REST OF THE SYSTEM sees it, not as the daemon
@@ -216,15 +223,15 @@ static void events_deep_sync(void) {
  * A write to /dev/uinput is not an event. It goes through the kernel's
  * input_handle_event(), which for EV_KEY drops any 0/1 whose value already
  * matches the key's current state - only autorepeat (2) bypasses that. The
- * daemon leans on this on purpose: socd_apply's S_RELEASE/S_PRESS arm writes
- * an up/down pair unconditionally, and analog_socd_edge documents that when
- * the dipping key is the one whose virtual stepped aside as the latch armed,
+ * daemon leans on this on purpose: machine_apply's S_RELEASE/S_PRESS arm writes
+ * an up/down pair unconditionally, and analog_machine_edge documents that when
+ * the dipping key is the one whose note stepped aside as the latch armed,
  * BOTH halves land on keys already in that state and the kernel eats them.
  * That is called out there as "the common case, not a corner" - it is every
  * lift out of a rock on one side.
  *
- * Counting raw writes therefore over-reports presses against what a reader of
- * the virtual device actually receives, and it over-reports them precisely in
+ * Counting raw writes therefore over-reports notes against what a reader of
+ * the virtual keyboard actually receives, and it over-reports them precisely in
  * the gesture this branch exists for. So mirror the filter here: replay is
  * only worth anything if its number is the number you could have measured off
  * the device. */
@@ -233,7 +240,7 @@ static unsigned char g_vkey[KEY_MAX + 1];
 static void replay_emit(unsigned type, unsigned code, int value) {
     if (type != EV_KEY || code > KEY_MAX)
         return;
-    events_deep_sync();
+    events_latch_sync();
     if (value == 2)                     /* autorepeat bypasses the state test */
         return;
     if (!!g_vkey[code] == !!value) {    /* no change: the kernel drops it */
@@ -242,7 +249,7 @@ static void replay_emit(unsigned type, unsigned code, int value) {
     }
     g_vkey[code] = value ? 1 : 0;
     if (value)
-        g_run.presses++;
+        g_run.notes++;
     /* After the filter, so the stream is what the device delivered. */
     if (g_events) {
         const char *nm = libevdev_event_code_get_name(EV_KEY, code);
@@ -264,14 +271,14 @@ static void replay_run(const trace_t *tr, const oid_config_t *cfg,
     ad.arm_on_report = g_arm_on_report;
     memset(&g_run, 0, sizeof(g_run));
     memset(g_vkey, 0, sizeof(g_vkey));   /* the sweep re-runs this pass */
-    g_run.first_engage_us = -1;
+    g_run.first_arm_us = -1;
     g_log_quiet = 1;                     /* -v lists the latches instead */
     g_ad          = &ad;
-    g_logged_deep = 0;
+    g_logged_armed = 0;
     g_origin_us   = tr->f[0].us;
 
     for (size_t i = 0; i < tr->n; i++) {
-        int   was = ad.deep;
+        int   was = ad.armed;
 
         /* The daemon's latch-debounce timer. The board reports on change, so
          * a still plant leaves a gap in the trace and the daemon arms from a
@@ -281,21 +288,21 @@ static void replay_run(const trace_t *tr, const oid_config_t *cfg,
          * `arm_on_report` there is never a deadline and this is skipped:
          * that daemon had no timer to fire. */
         uint64_t dl;
-        if (analog_deep_deadline(&ad, cfg, &dl) &&
+        if (analog_latch_deadline(&ad, cfg, &dl) &&
             dl <= (uint64_t)tr->f[i].us * 1000ull) {
             g_now_us = (long long)(dl / 1000ull);
-            analog_deep_tick(&ad, cfg, dl);
-            events_deep_sync();
-            if (ad.deep) {
+            analog_latch_tick(&ad, cfg, dl);
+            events_latch_sync();
+            if (ad.armed) {
                 long long at = g_now_us - tr->f[0].us;
-                g_run.engagements++;
-                if (g_run.first_engage_us < 0)
-                    g_run.first_engage_us = at;
+                g_run.arms++;
+                if (g_run.first_arm_us < 0)
+                    g_run.first_arm_us = at;
                 if (g_verbose)
                     printf("  latched at %8.3fs   (debounce timer, no report)\n",
                            at / 1e6);
             }
-            was = ad.deep;
+            was = ad.armed;
         }
         g_now_us = tr->f[i].us;
 
@@ -306,15 +313,15 @@ static void replay_run(const trace_t *tr, const oid_config_t *cfg,
         /* The trace's own timestamp, so the placement path sees real
          * inter-report spacing rather than a synthetic constant. */
         analog_report(&ad, cfg, depth, (uint64_t)tr->f[i].us * 1000ull);
-        events_deep_sync();
+        events_latch_sync();
 
-        if (!was && ad.deep) {
+        if (!was && ad.armed) {
             /* From the first report, not from `us` = 0: an anchored trace
              * counts `us` from the header's t0, a little before that. */
             long long at = tr->f[i].us - tr->f[0].us;
-            g_run.engagements++;
-            if (g_run.first_engage_us < 0)
-                g_run.first_engage_us = at;
+            g_run.arms++;
+            if (g_run.first_arm_us < 0)
+                g_run.first_arm_us = at;
             if (g_verbose)
                 printf("  latched at %8.3fs   k1=%.2fmm  k2=%.2fmm\n",
                        at / 1e6, (double)tr->f[i].mm[0],
@@ -343,7 +350,7 @@ static void replay_run(const trace_t *tr, const oid_config_t *cfg,
  *
  * That is not a cosmetic hole. analog_key_feed carries `rt_extreme` from
  * sample to sample, so missing samples move where reversals fire, and
- * analog_deep_update wants both keys on the backplate in ONE report - drop
+ * analog_latch_update wants both keys on the backplate in ONE report - drop
  * that report and the latch the daemon really armed never appears here.
  * A replay off a holey trace disagrees with the live daemon and looks like a
  * state-machine bug.
@@ -441,12 +448,12 @@ static void report_gaps(const trace_t *tr, const oid_config_t *cfg) {
 
 /* Could this trace EVER have armed the latch, and by how much did it miss?
  *
- * Arming is one test - both keys at or past travel_mm - bottom_out_mm in a
+ * Arming is one test - both keys at or past travel_mm - backplate_mm in a
  * SINGLE report - so the whole question reduces to one number: the largest
  * min(k1, k2) anywhere in the trace. Everything else about the trace is
  * irrelevant to it. If that number is under the backplate the latch was
- * unreachable, the daemon was right to stay on the plain remap, and no
- * amount of state-machine reading will explain the "missing" toggle - the
+ * unreachable, the daemon was right to keep the pair independent, and no
+ * amount of state-machine reading will explain the "missing" trill - the
  * fingers, or the board's reported maximum, never got there.
  *
  * That last case is real and easy to miss: the firmware reports a fraction
@@ -454,7 +461,7 @@ static void report_gaps(const trace_t *tr, const oid_config_t *cfg) {
  * cannot arm however hard you press. The number this prints is measured, so
  * it settles that without a guess. */
 static void report_headroom(const trace_t *tr, const oid_config_t *cfg) {
-    float floor_mm = cfg->analog.travel_mm - cfg->analog.bottom_out_mm;
+    float backplate_depth = cfg->analog.travel_mm - cfg->analog.backplate_mm;
     float best = 0.0f;
 
     for (size_t i = 0; i < tr->n; i++) {
@@ -464,17 +471,17 @@ static void report_headroom(const trace_t *tr, const oid_config_t *cfg) {
     }
 
     printf("  deepest both keys ever were together: %.2fmm "
-           "(backplate %.2fmm)\n", (double)best, (double)floor_mm);
-    if (best >= floor_mm)
+           "(backplate %.2fmm)\n", (double)best, (double)backplate_depth);
+    if (best >= backplate_depth)
         return;
     printf("  the latch was UNREACHABLE in this trace - short by %.2fmm. "
            "Either\n"
            "  the keys were never both bottomed in one report, or the board "
            "reports\n"
-           "  less than full travel. bottom_out_mm would have to be >= "
+           "  less than full travel. backplate_mm would have to be >= "
            "%.2fmm to arm\n"
            "  on this recording.\n",
-           (double)(floor_mm - best),
+           (double)(backplate_depth - best),
            (double)(cfg->analog.travel_mm - best));
 }
 
@@ -515,7 +522,7 @@ static void report_style(const trace_t *tr, const oid_config_t *cfg) {
         }
     }
 
-    printf("\nkeypress depth distribution (%u presses)\n", npress);
+    printf("\nstroke depth distribution (%u strokes)\n", npress);
     if (!npress) { printf("  none\n"); return; }
 
     unsigned max = 1;
@@ -527,15 +534,15 @@ static void report_style(const trace_t *tr, const oid_config_t *cfg) {
         printf("  %4.2f-%4.2fmm %5u |%.*s%*s|%s\n",
                (double)lo, (double)hi, bucket[b], w,
                "############################################", 44 - w, "",
-               (lo <= travel - cfg->analog.bottom_out_mm &&
-                travel - cfg->analog.bottom_out_mm < hi)
+               (lo <= travel - cfg->analog.backplate_mm &&
+                travel - cfg->analog.backplate_mm < hi)
                    ? "  <- backplate" : "");
     }
     printf("  mean peak %.2fmm, deepest %.2fmm, backplate at %.2fmm "
            "(%.0f%% of travel)\n",
            sum / npress, deepest,
-           (double)(travel - cfg->analog.bottom_out_mm),
-           (double)(travel - cfg->analog.bottom_out_mm) / travel * 100.0);
+           (double)(travel - cfg->analog.backplate_mm),
+           (double)(travel - cfg->analog.backplate_mm) / travel * 100.0);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -543,7 +550,7 @@ static void report_style(const trace_t *tr, const oid_config_t *cfg) {
 static int usage(const char *prog) {
     fprintf(stderr,
             "usage: %s [-c CONFIG] [-e EVENTS] [-a RULE] [-v] [-q] TRACE.csv\n"
-            "  -e  write virtual key transitions and deep latch\n"
+            "  -e  write virtual keyboard transitions and the latch\n"
             "      changes as CSV to EVENTS (- for stdout)\n"
             "  -a  when a debounced latch arms: `deadline` (when the window\n"
             "      runs out, as the daemon does now) or `report` (on the\n"
@@ -551,7 +558,7 @@ static int usage(const char *prog) {
             "      the rule the trace was played under when replaying it as\n"
             "      played, `deadline` with -c or with no recorded thresholds\n"
             "  -v  list every latch\n"
-            "  -q  skip the bottom_out_mm sweep\n", prog);
+            "  -q  skip the backplate_mm sweep\n", prog);
     return EXIT_FAILURE;
 }
 
@@ -706,37 +713,37 @@ int main(int argc, char **argv) {
             fprintf(stderr, "replay: %s: %s\n", events_path, strerror(errno));
         g_events = NULL;                /* the sweep is not the session */
     }
-    /* `presses` is what a reader of the virtual device receives; `dropped`
+    /* `notes` is what a reader of the virtual keyboard receives; `dropped`
      * is the daemon's unconditional up/down writes that the kernel swallows
      * because the key was already in that state. Both are shown so a count
      * taken off the real device can be reconciled against this one. */
-    printf("  %u deep latch%s, %u virtual presses emitted "
+    printf("  latch armed %u time%s, %u notes emitted "
            "(%u no-change writes dropped by the kernel)\n",
-           r.engagements, r.engagements == 1 ? "" : "es", r.presses,
+           r.arms, r.arms == 1 ? "" : "s", r.notes,
            r.dropped);
-    if (r.engagements)
-        printf("  first at %.3fs\n", r.first_engage_us / 1e6);
+    if (r.arms)
+        printf("  first at %.3fs\n", r.first_arm_us / 1e6);
     report_headroom(&tr, &cfg);
 
     report_style(&tr, &cfg);
 
     if (sweep) {
-        printf("\ndeep latches vs bottom_out_mm (where the backplate "
+        printf("\nlatch arms vs backplate_mm (where the backplate "
                "starts)\n");
-        float keep = cfg.analog.bottom_out_mm;
+        float keep = cfg.analog.backplate_mm;
         static const float bo[] = { 0.02f, 0.05f, 0.08f, 0.10f, 0.15f,
                                     0.20f, 0.30f, 0.50f, 0.80f };
         for (size_t i = 0; i < sizeof(bo) / sizeof(bo[0]); i++) {
-            cfg.analog.bottom_out_mm = bo[i];
+            cfg.analog.backplate_mm = bo[i];
             replay_run(&tr, &cfg, &r);
-            printf("  %4.2fmm  (backplate at %5.2fmm, %4.1f%%)  %5u latches\n",
+            printf("  %4.2fmm  (backplate at %5.2fmm, %4.1f%%)  %5u arms\n",
                    (double)bo[i],
                    (double)(cfg.analog.travel_mm - bo[i]),
                    (double)((cfg.analog.travel_mm - bo[i])
                             / cfg.analog.travel_mm * 100.0f),
-                   r.engagements);
+                   r.arms);
         }
-        cfg.analog.bottom_out_mm = keep;
+        cfg.analog.backplate_mm = keep;
     }
 
     free(tr.f);
