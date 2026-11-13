@@ -21,6 +21,8 @@ static void test_emit(unsigned type, unsigned code, int value);
 
 #define V1 44   /* KEY_Z */
 #define V2 45   /* KEY_X */
+#define V3 46   /* KEY_C - the second pair's virtuals (cases W, X) */
+#define V4 47   /* KEY_V */
 
 static char log_buf[512];
 static int  fails;
@@ -29,7 +31,7 @@ static int  fails;
  * not change it are dropped there and never reach the game, so the harness
  * drops them too: every assertion below is about what a player actually
  * gets, not about what the daemon happened to write. */
-static int vstate[2];
+static int vstate[4];
 
 /* Counted here rather than by sampling vstate between reports: a handover
  * onto an already-down key cycles it (release then press) WITHIN one report,
@@ -42,7 +44,9 @@ static unsigned vrepeats;
 
 static void test_emit(unsigned type, unsigned code, int value) {
     if (type != EV_KEY) return;                    /* ignore SYN */
-    int k = (code == V1) ? 0 : 1;
+    if (code != V1 && code != V2 && code != V3 && code != V4)
+        return;                         /* passthrough, not a virtual */
+    int k = code == V1 ? 0 : code == V2 ? 1 : code == V3 ? 2 : 3;
     /* Autorepeat is not a transition: the kernel forwards value 2 to
      * userspace and leaves the key down. Counting it separately keeps it out
      * of the press/release log while still letting a test assert it was
@@ -53,7 +57,8 @@ static void test_emit(unsigned type, unsigned code, int value) {
     if (value) vpresses++;
     size_t n = strlen(log_buf);
     snprintf(log_buf + n, sizeof log_buf - n, "%s%s%c",
-             n ? " " : "", k == 0 ? "v1" : "v2", value ? '+' : '-');
+             n ? " " : "", (const char *[]){ "v1", "v2", "v3", "v4" }[k],
+             value ? '+' : '-');
 }
 
 static void reset_log(void) { log_buf[0] = '\0'; }
@@ -77,7 +82,7 @@ static void expect_int(const char *what, int got, int want) {
 }
 
 static oid_config_t cfg;
-static analog_dev_t ad;
+static analog_pair_t ad;   /* pair 0, the one every case before W drives */
 
 /* One analog report, exactly as analog_drain processes it. */
 static void sample(float d0, float d1) {
@@ -112,11 +117,11 @@ static void sample_at(double ms, float d0, float d1) {
  * rebuilds each frame from. Writes are 64 bytes, well under PIPE_BUF, so
  * each read() lifts exactly one report the way it does from hidraw.
  * ---------------------------------------------------------------------- */
-static void encode_v2(unsigned char *b, const uint16_t *usage,
-                      const float *depth, float travel) {
+static void encode_v2n(unsigned char *b, const uint16_t *usage,
+                       const float *depth, int nkeys, float travel) {
     int slot = 0;
     memset(b, 0, ANALOG_V2_REPORT);
-    for (int k = 0; k < 2; k++) {
+    for (int k = 0; k < nkeys; k++) {
         if (depth[k] <= 0.0f) continue;          /* at rest: not reported */
         unsigned v10 = (unsigned)(depth[k] / travel * 1023.0f + 0.5f);
         if (v10 > 1023) v10 = 1023;
@@ -127,9 +132,14 @@ static void encode_v2(unsigned char *b, const uint16_t *usage,
     }
 }
 
+static void encode_v2(unsigned char *b, const uint16_t *usage,
+                      const float *depth, float travel) {
+    encode_v2n(b, usage, depth, 2, travel);
+}
+
 static void fresh(void) {
     memset(&ad, 0, sizeof ad);
-    vstate[0] = vstate[1] = 0;
+    memset(vstate, 0, sizeof vstate);
     vpresses  = 0;
     reset_log();
 }
@@ -147,10 +157,11 @@ static socd_state_t ds;
 static void dfresh(int socd) {
     memset(&dcfg, 0, sizeof dcfg);
     memset(&ds, 0, sizeof ds);
-    dcfg.socd = socd;
-    dcfg.v1   = V1;
-    dcfg.v2   = V2;
-    vstate[0] = vstate[1] = 0;
+    dcfg.n_pairs      = 1;
+    dcfg.pair[0].socd = socd;
+    dcfg.pair[0].v1   = V1;
+    dcfg.pair[0].v2   = V2;
+    memset(vstate, 0, sizeof vstate);
     vpresses  = 0;
     vrepeats  = 0;
     reset_log();
@@ -159,23 +170,24 @@ static void dfresh(int socd) {
 /* One physical key edge: k == 0 is k1, k == 1 is k2. */
 static void dkey(int k, int value) {
     reset_log();
-    socd_apply(&ds, k == 0, value, dcfg.socd, &dcfg);
+    socd_apply(&ds, k == 0, value, dcfg.pair[0].socd, &dcfg.pair[0]);
 }
 
 /* Press-then-release, for the common "tap a key on its own" shape. */
 static void dtap(int k) {
     reset_log();
-    socd_apply(&ds, k == 0, 1, dcfg.socd, &dcfg);
-    socd_apply(&ds, k == 0, 0, dcfg.socd, &dcfg);
+    socd_apply(&ds, k == 0, 1, dcfg.pair[0].socd, &dcfg.pair[0]);
+    socd_apply(&ds, k == 0, 0, dcfg.pair[0].socd, &dcfg.pair[0]);
 }
 
 
 int main(void) {
     g_log_quiet = 1;   /* the assertions are the output; not the latch log */
     memset(&cfg, 0, sizeof cfg);
-    cfg.socd = SOCD_ANALOG;
-    cfg.v1   = V1;
-    cfg.v2   = V2;
+    cfg.n_pairs      = 1;
+    cfg.pair[0].socd = SOCD_ANALOG;
+    cfg.pair[0].v1   = V1;
+    cfg.pair[0].v2   = V2;
     /* The daemon defaults, so the numbers here are the ones a player sees:
      * backplate at 3.80mm (95% of travel), latch disarms at 1.00mm. */
     cfg.analog.travel_mm     = 4.00f;
@@ -398,8 +410,9 @@ int main(void) {
             dd.kind = EP_ANALOG;
             dd.fd   = fd[0];
             dd.fmt  = ANALOG_FMT_V2;
-            dd.usage[0] = 0x1d;            /* KEY_Z */
-            dd.usage[1] = 0x1b;            /* KEY_X */
+            dd.n_pairs          = 1;
+            dd.pair[0].usage[0] = 0x1d;    /* KEY_Z */
+            dd.pair[0].usage[1] = 0x1b;    /* KEY_X */
             snprintf(dd.path, sizeof dd.path, "pipe");
             fcntl(fd[0], F_SETFL, O_NONBLOCK);
             vstate[0] = vstate[1] = 0;
@@ -407,16 +420,16 @@ int main(void) {
             for (size_t i = 0; i < nstep; i++) {
                 unsigned char rep[ANALOG_V2_REPORT];
                 float         d[2] = { gesture[i][0], gesture[i][1] };
-                encode_v2(rep, dd.usage, d, cfg.analog.travel_mm);
+                encode_v2(rep, dd.pair[0].usage, d, cfg.analog.travel_mm);
                 reset_log();
                 if (write(fd[1], rep, sizeof rep) != (ssize_t)sizeof rep) {
                     printf("  FAIL short write to the drain pipe\n");
                     fails++;
                     break;
                 }
-                int was = dd.deep;
+                int was = dd.pair[0].deep;
                 analog_drain(&dd, &cfg);
-                if (!was && dd.deep) arm_drain++;
+                if (!was && dd.pair[0].deep) arm_drain++;
                 size_t n = strlen(drained);
                 snprintf(drained + n, sizeof drained - n, "%s%s",
                          n && log_buf[0] ? "|" : "", log_buf);
@@ -439,7 +452,8 @@ int main(void) {
              * of the plain remap. */
             expect_int("  direct path armed exactly once", (int)arm_direct, 1);
             expect_int("  drain path armed exactly once", (int)arm_drain, 1);
-            expect_int("  and both ended disarmed", dd.deep | ad.deep, 0);
+            expect_int("  and both ended disarmed",
+                       dd.pair[0].deep | ad.deep, 0);
         }
     }
 
@@ -686,6 +700,268 @@ int main(void) {
     expect_int("a fresh device is back on the timer",
                analog_deep_deadline(&ad, &cfg, &dl), 1);
     cfg.analog.latch_debounce_ms = 0.0f;
+
+    /* ------------------------------------------------------------------ *
+     * Pairs (W, X, Y). Everything above runs one pair, which is the
+     * regression gate; these are about two pairs being two machines that
+     * never see each other. The taiko shape: dons on one pair, kats on the
+     * other.
+     * ------------------------------------------------------------------ */
+    {
+        oid_config_t pc;
+        memset(&pc, 0, sizeof pc);
+        pc.analog    = cfg.analog;
+        pc.n_pairs   = 2;
+        pc.pair[0]   = (keypair_t){ .k1 = KEY_Z, .k2 = KEY_X, .v1 = V1,
+                                    .v2 = V2, .socd = SOCD_ANALOG,
+                                    .hid_k1 = -1, .hid_k2 = -1 };
+        pc.pair[1]   = (keypair_t){ .k1 = KEY_A, .k2 = KEY_S, .v1 = V3,
+                                    .v2 = V4, .socd = SOCD_ANALOG,
+                                    .hid_k1 = -1, .hid_k2 = -1 };
+
+        int fd[2];
+        if (pipe(fd) != 0) {
+            printf("  FAIL pipe for case W: %s\n", strerror(errno));
+            fails++;
+            goto skip_w;
+        }
+        fcntl(fd[0], F_SETFL, O_NONBLOCK);
+        analog_dev_t bd;
+        memset(&bd, 0, sizeof bd);
+        bd.kind    = EP_ANALOG;
+        bd.fd      = fd[0];
+        bd.fmt     = ANALOG_FMT_V2;
+        bd.n_pairs = 2;
+        bd.pair[0].idx = 0;
+        bd.pair[1].idx = 1;
+        static const uint16_t usage4[4] = { 0x1d, 0x1b, 0x04, 0x16 };
+        memcpy(bd.pair[0].usage, usage4,     sizeof bd.pair[0].usage);
+        memcpy(bd.pair[1].usage, usage4 + 2, sizeof bd.pair[1].usage);
+        snprintf(bd.path, sizeof bd.path, "pipe");
+
+        /* One hardware report carrying all four keys, through the real
+         * read/decode/dispatch path. */
+        #define BOARD(t, a, b, c, d) do {                                   \
+            float dd4[4] = { a, b, c, d };                                  \
+            unsigned char rep[ANALOG_V2_REPORT];                            \
+            encode_v2n(rep, usage4, dd4, 4, pc.analog.travel_mm);           \
+            reset_log();                                                    \
+            if (write(fd[1], rep, sizeof rep) != (ssize_t)sizeof rep) {     \
+                printf("  FAIL short write\n"); fails++;                    \
+            }                                                               \
+            analog_drain(&bd, &pc);                                         \
+            (void)(t);                                                      \
+        } while (0)
+
+        puts("W. two analog pairs on one board: two latches, never one");
+        memset(vstate, 0, sizeof vstate);
+        BOARD(0, 3.85f, 0.00f, 0.00f, 0.00f);
+        expect_log("pair 0 k1 plants", "v1+");
+        BOARD(0, 3.85f, 3.85f, 0.00f, 0.00f);
+        expect_log("pair 0 k2 slams down: arms, toggles to it", "v1- v2+");
+        expect_int("  pair 0 armed", bd.pair[0].deep, 1);
+        expect_int("  pair 1 untouched", bd.pair[1].deep, 0);
+        BOARD(0, 3.85f, 3.85f, 2.00f, 0.00f);
+        expect_log("pair 1 taps while pair 0 rides", "v3+");
+        BOARD(0, 3.85f, 3.85f, 0.00f, 0.00f);
+        expect_log("  and lifts: a plain release", "v3-");
+        BOARD(0, 3.85f, 3.85f, 3.20f, 3.85f);
+        expect_log("pair 1 overlaps short of the floor: plain remap",
+                   "v3+ v4+");
+        expect_int("  pair 1 still not armed", bd.pair[1].deep, 0);
+        BOARD(0, 3.85f, 3.60f, 3.20f, 3.85f);
+        expect_log("pair 0 rocks under it: one beat, pair 0 only", "v2- v1+");
+        BOARD(0, 3.85f, 3.60f, 0.00f, 0.00f);
+        expect_log("pair 1 releases both", "v3- v4-");
+
+        /* The big note: both keys of one colour slammed onto the floor in
+         * ONE report and released together. With no debounce it arms, and
+         * it arms before either press edge has been routed - so the
+         * reconciliation presses the survivor itself, and the other key's
+         * press and the toggle's release of it land in the same report: a
+         * ZERO-LENGTH press. Still two notes, never three, but one of them
+         * is a down/up a game may not see. This is why taiko wants a
+         * debounce; the next block is the same strike with one. */
+        BOARD(0, 3.85f, 3.60f, 3.85f, 3.85f);
+        expect_log("big note, no debounce: arms, one press is zero-length",
+                   "v4+ v3+ v3-");
+        BOARD(0, 3.85f, 3.60f, 0.00f, 0.00f);
+        expect_log("  both lift together: one release, no phantom", "v4-");
+        expect_int("  pair 1 disarmed", bd.pair[1].deep, 0);
+        expect_int("  pair 0 never noticed", bd.pair[0].deep, 1);
+
+        BOARD(0, 0.00f, 0.00f, 0.00f, 0.00f);
+        expect_log("pair 0 leaves the floor: pair 0 disarms", "v1-");
+
+        /* The same big note under a debounce: the strike is an instant, so
+         * the window never runs out, the pair stays on the plain remap, and
+         * both notes are ordinary presses and releases. */
+        pc.analog.latch_debounce_ms = 30.0f;
+        {
+            float b0[2] = { 0.00f, 0.00f }, b1[2] = { 3.85f, 3.85f },
+                  b2[2] = { 0.00f, 0.00f };
+            reset_log();
+            analog_report(&bd.pair[1], &pc, b1, 100000000ull);
+            analog_report(&bd.pair[0], &pc, b0, 100000000ull);
+            expect_log("big note, 30ms debounce: two plain presses",
+                       "v3+ v4+");
+            reset_log();
+            analog_report(&bd.pair[1], &pc, b2, 112000000ull);
+            expect_log("  released 12ms later: two plain releases",
+                       "v3- v4-");
+            expect_int("  never armed", bd.pair[1].deep, 0);
+        }
+        pc.analog.latch_debounce_ms = 0.0f;
+        expect_int("  nothing held anywhere",
+                   vstate[0] + vstate[1] + vstate[2] + vstate[3], 0);
+
+        /* The shared timer: two plants pending at once, one deadline each,
+         * and the timerfd follows the EARLIER. A tick arms only the pair
+         * whose window has run out. */
+        pc.analog.latch_debounce_ms = 30.0f;
+        uint64_t wdl = 0;
+        float a0[2] = { 3.85f, 3.85f }, a1[2] = { 3.85f, 3.85f };
+        memset(vstate, 0, sizeof vstate);
+        analog_report(&bd.pair[1], &pc, a1, 10000000ull);
+        analog_report(&bd.pair[0], &pc, a0, 20000000ull);
+        expect_int("two plants pending: one deadline",
+                   analog_dev_deadline(&bd, &pc, &wdl), 1);
+        expect_int("  it is pair 1's, the earlier (40ms)",
+                   (int)(wdl / 1000000ull), 40);
+        reset_log();
+        analog_dev_tick(&bd, &pc, wdl);
+        expect_int("  the tick arms pair 1", bd.pair[1].deep, 1);
+        expect_int("  and not pair 0, 10ms short", bd.pair[0].deep, 0);
+        expect_int("  the timer moves on to pair 0's (50ms)",
+                   analog_dev_deadline(&bd, &pc, &wdl) &&
+                   wdl / 1000000ull == 50, 1);
+        analog_dev_tick(&bd, &pc, wdl);
+        expect_int("  which arms pair 0 in turn", bd.pair[0].deep, 1);
+        expect_int("  and nothing is left to wait for",
+                   analog_dev_deadline(&bd, &pc, &wdl), 0);
+        #undef BOARD
+        close(fd[0]);
+        close(fd[1]);
+    }
+skip_w:
+
+    puts("X. two digital pairs: separate machines, and a mixed board");
+    {
+        oid_config_t pc;
+        memset(&pc, 0, sizeof pc);
+        pc.n_pairs = 2;
+        pc.pair[0] = (keypair_t){ .k1 = KEY_D, .k2 = KEY_F, .v1 = V1,
+                                  .v2 = V2, .socd = SOCD_TOGGLE };
+        pc.pair[1] = (keypair_t){ .k1 = KEY_J, .k2 = KEY_K, .v1 = V3,
+                                  .v2 = V4, .socd = SOCD_TOGGLE };
+        input_dev_t in;
+        memset(&in, 0, sizeof in);
+        memset(vstate, 0, sizeof vstate);
+        #define KEY(c, v) do {                                              \
+            struct input_event ie = { .type = EV_KEY, .code = (c),          \
+                                      .value = (v) };                       \
+            reset_log();                                                    \
+            process_event(&in, &ie, &pc);                                   \
+        } while (0)
+
+        KEY(KEY_D, 1); expect_log("pair 0 k1 down", "v1+");
+        KEY(KEY_J, 1); expect_log("pair 1 k1 down: no stealing across pairs",
+                                  "v3+");
+        KEY(KEY_F, 1); expect_log("pair 0 k2: toggles inside pair 0 only",
+                                  "v1- v2+");
+        expect_int("  pair 1's virtual still held", vstate[2], 1);
+        KEY(KEY_D, 0); expect_log("pair 0 k1 up: pair 0 reverts", "v2- v1+");
+        KEY(KEY_J, 0); expect_log("pair 1 k1 up: just a release", "v3-");
+        KEY(KEY_F, 0); KEY(KEY_K, 1);
+        expect_log("pair 1 k2 alone", "v4+");
+        KEY(KEY_K, 0);
+        KEY(KEY_A, 1); expect_log("a key in no pair passes through", "");
+
+        /* Mixed board: dons analog, kats digital toggle. On the analog
+         * board only the analog pair's digital copies are dropped - the
+         * digital pair has nobody else to drive it. */
+        pc.pair[0].socd = SOCD_ANALOG;
+        memset(&in, 0, sizeof in);
+        in.analog = 1;
+        memset(vstate, 0, sizeof vstate);
+        KEY(KEY_D, 1); expect_log("analog pair's digital copy: dropped", "");
+        KEY(KEY_J, 1); expect_log("digital pair on the same board: driven",
+                                  "v3+");
+        KEY(KEY_K, 1); expect_log("  and toggles", "v3- v4+");
+        KEY(KEY_J, 0); KEY(KEY_K, 0); KEY(KEY_D, 0);
+
+        /* release_stuck on a dying device covers every pair. */
+        memset(&in, 0, sizeof in);
+        pc.pair[0].socd = SOCD_TOGGLE;
+        memset(vstate, 0, sizeof vstate);
+        KEY(KEY_D, 1); KEY(KEY_K, 1);
+        reset_log();
+        for (int p = 0; p < pc.n_pairs; p++)
+            release_stuck(&in.socd[p], &pc.pair[p]);
+        expect_log("device dies holding both pairs: both released",
+                   "v1- v4-");
+        #undef KEY
+    }
+
+    puts("Y. config: the legacy spelling is pair 0, and pairs share nothing");
+    {
+        static const struct { const char *what, *yaml; int ok, n; } cf[] = {
+            { "keys: is one pair, socd and analog.hid_* its own",
+              "socd: analog\nkeys: {k1: KEY_Z, k2: KEY_X, v1: KEY_Z, "
+              "v2: KEY_X}\nanalog: {hid_k1: 0x1d}\n", 1, 1 },
+            { "pairs: two entries, socd defaulted from the top",
+              "socd: snappy\npairs:\n"
+              "  - {k1: KEY_F, k2: KEY_J, v1: KEY_F, v2: KEY_J, socd: analog}\n"
+              "  - {k1: KEY_D, k2: KEY_K, v1: KEY_D, v2: KEY_K}\n", 1, 2 },
+            { "keys: and pairs: together is refused",
+              "keys: {k1: KEY_Z}\npairs:\n"
+              "  - {k1: KEY_F, k2: KEY_J, v1: KEY_F, v2: KEY_J}\n", 0, 0 },
+            { "a physical key in two pairs is refused",
+              "pairs:\n  - {k1: KEY_F, k2: KEY_J, v1: KEY_1, v2: KEY_2}\n"
+              "  - {k1: KEY_J, k2: KEY_K, v1: KEY_3, v2: KEY_4}\n", 0, 0 },
+            { "a virtual key in two pairs is refused",
+              "pairs:\n  - {k1: KEY_F, k2: KEY_J, v1: KEY_1, v2: KEY_2}\n"
+              "  - {k1: KEY_D, k2: KEY_K, v1: KEY_2, v2: KEY_3}\n", 0, 0 },
+            { "a pair entry missing a key is refused",
+              "pairs:\n  - {k1: KEY_F, k2: KEY_J, v1: KEY_1}\n", 0, 0 },
+            { "analog.hid_k1 with pairs: is refused (ambiguous)",
+              "pairs:\n  - {k1: KEY_F, k2: KEY_J, v1: KEY_1, v2: KEY_2}\n"
+              "analog: {hid_k1: 0x09}\n", 0, 0 },
+        };
+        char path[] = "/tmp/regimetest-XXXXXX";
+        int  tfd = mkstemp(path);
+        for (size_t i = 0; tfd >= 0 && i < sizeof cf / sizeof cf[0]; i++) {
+            if (ftruncate(tfd, 0) != 0 ||
+                pwrite(tfd, cf[i].yaml, strlen(cf[i].yaml), 0) < 0) {
+                printf("  FAIL could not write %s\n", path);
+                fails++;
+                break;
+            }
+            oid_config_t yc;
+            config_init(&yc);
+            g_log_quiet = 1;
+            int saved = dup(2), devnull = open("/dev/null", O_WRONLY);
+            dup2(devnull, 2);            /* the refusals log errors */
+            int rc = load_config(path, &yc);
+            dup2(saved, 2);
+            close(saved);
+            close(devnull);
+            expect_int(cf[i].what, rc == 0, cf[i].ok);
+            if (rc == 0 && cf[i].ok) {
+                expect_int("  pair count", yc.n_pairs, cf[i].n);
+                if (i == 0)
+                    expect_int("  hid_k1 landed on pair 0",
+                               yc.pair[0].hid_k1 == 0x1d &&
+                               yc.pair[0].socd == SOCD_ANALOG, 1);
+                if (i == 1)
+                    expect_int("  per-pair socd, and the default",
+                               yc.pair[0].socd == SOCD_ANALOG &&
+                               yc.pair[1].socd == SOCD_SNAPPY, 1);
+                config_free(&yc);
+            }
+        }
+        if (tfd >= 0) { close(tfd); unlink(path); }
+    }
 
     printf("\n%s\n", fails ? "FAILURES ABOVE" : "all assertions passed");
     return fails ? 1 : 0;

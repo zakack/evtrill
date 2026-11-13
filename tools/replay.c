@@ -192,7 +192,7 @@ static int        g_arm_on_report;
 /* -e: the event stream. NULL when not asked for, and during the sweep, whose
  * passes are hypotheticals rather than the session. */
 static FILE               *g_events;
-static const analog_dev_t *g_ad;          /* the pass in progress */
+static const analog_pair_t *g_ad;         /* the pass in progress */
 static int                 g_logged_deep;
 static long long           g_origin_us;   /* the trace's first report */
 
@@ -257,8 +257,10 @@ static void replay_emit(unsigned type, unsigned code, int value) {
 
 static void replay_run(const trace_t *tr, const oid_config_t *cfg,
                        run_t *out) {
-    analog_dev_t ad;
+    /* One pair - the one -T records - since a trace is two keys wide. */
+    analog_pair_t ad;
     memset(&ad, 0, sizeof(ad));
+    ad.idx           = cfg_trace_pair(cfg);
     ad.arm_on_report = g_arm_on_report;
     memset(&g_run, 0, sizeof(g_run));
     memset(g_vkey, 0, sizeof(g_vkey));   /* the sweep re-runs this pass */

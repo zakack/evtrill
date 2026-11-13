@@ -5,16 +5,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 `doubletapd` is a single-file C11 daemon that acts as a SOCD (Simultaneous
-Opposing Cardinal Directions) cleaner for two keyboard keys. It exclusively
+Opposing Cardinal Directions) cleaner for PAIRS of keyboard keys — one pair
+by default, up to `MAX_PAIRS` (8), each an independent machine. It exclusively
 grabs evdev keyboard devices at the kernel level (before Xorg/Wayland see
 them) — either an explicit config list or, by default, every
-keyboard-shaped device advertising both configured keys, with
-inotify-driven hotplug in both cases — applies a SOCD state machine to two
-configured physical keys — "toggle" (last-input + reverting toggle; "on"
+keyboard-shaped device advertising every configured key, with
+inotify-driven hotplug in both cases — applies a SOCD state machine to each
+pair of configured physical keys — "toggle" (last-input + reverting toggle; "on"
 is a synonym), "snappy" (last input wins, no latching), "analog" (toggle,
 but driven by travel depth read from an analog keyboard), or "off" (no
-cleaning, just the k1/k2 -> v1/v2 remap), selected by the top-level
-`socd` config field — and re-emits all input through a
+cleaning, just the k1/k2 -> v1/v2 remap), selected per pair (defaulting to
+the top-level `socd` config field) — and re-emits all input through a
 single uinput virtual keyboard. Built for rhythm games (osu!) where fast key
 alternation needs a "rocking" input pattern instead of naive SOCD handling.
 
@@ -23,7 +24,7 @@ voice pool, trigger ring) was excised on this branch along with everything
 that existed to serve it — see "What the audio excision took with it" below
 before adding anything that looks like it is missing.
 
-The entire implementation lives in `doubletapd.c` (~2500 lines) — there is
+The entire implementation lives in `doubletapd.c` (~2900 lines) — there is
 no multi-module structure.
 
 ## Build
@@ -58,7 +59,9 @@ falls back to the installed default (`/usr/share/doubletap/config.yaml`;
 CMake bakes the real prefix in via the `DEF_CONFIG` compile definition). See `config.yaml` for the schema: `devices` (optional list of
 `/dev/input/by-id/*` paths; omitted or `auto` means auto-discovery), `socd`
 (`toggle` default, `on` as a synonym, `snappy`, `analog`, or `off`), `keys`
-(k1/k2 physical -> v1/v2 virtual, symbolic `KEY_*` names or numeric codes),
+(k1/k2 physical -> v1/v2 virtual, symbolic `KEY_*` names or numeric codes)
+or `pairs` (a list of those, each with optional `socd` and `hid_k1`/`hid_k2`
+— see "Pairs" below),
 `uinput` (virtual device name), `analog` (analog-mode thresholds; see
 below). Unknown keys are ignored, so a config that still carries an `audio:`
 section from before the excision loads without complaint. After
@@ -68,8 +71,9 @@ scanned/watched device directory (default `/dev/input`) — mainly for
 integration testing against a directory of symlinks to synthetic uinput
 nodes. The `-A` flag runs the analog monitor (live travel depth, no grab,
 no uinput device) for picking thresholds and discovering HID usage ids.
-`-T` is the same passivity with machine-readable output: CSV of k1/k2
-travel per report, for replaying a session offline — the header is
+`-T` is the same passivity with machine-readable output: CSV of ONE pair's
+k1/k2 travel per report (`cfg_trace_pair`: the first analog pair, else pair
+0 — `replay` replays the same one), for replaying a session offline — the header is
 `us,k1_mm,k2_mm` and every recorded trace under `tests/` is in that format.
 The `#` header anchors the trace in time: `t0_monotonic_ns` and
 `t0_realtime_ns` are read back to back just before it is written, and `us`
@@ -396,7 +400,9 @@ down in reverse order.
   front-end by a sample.
 - In analog mode the digital k1/k2 of the analog keyboard MUST be dropped
   (`in->analog`, set by matching vendor/product in `input_try_open`), or
-  every press is emitted twice — once from evdev and once from analog.
+  every press is emitted twice — once from evdev and once from analog. Only
+  for ANALOG-MODE pairs: a digital-mode pair on the same board has nothing
+  else driving it (`process_event` checks the pair's mode).
 - `analog_key_feed` must keep `live` in sync with the edges it actually
   emits; `socd_apply` assumes strict press/release alternation per key.
 - `release_mm` is DERIVED, never configured: `analog_config_resolve` sets
@@ -421,10 +427,12 @@ down in reverse order.
 
 ## Key invariants to preserve when editing `process_event`
 
-- `k1`/`k2`/`act` state lives in a `socd_state_t` owned by each input
-  source (embedded in `input_dev_t`, and in `analog_dev_t`), not global —
+- `k1`/`k2`/`act` state lives in a `socd_state_t` per PAIR per input
+  source (`input_dev_t.socd[]`, and `analog_pair_t.socd`), not global —
   multiple physical keyboards are tracked independently even though they
-  share one virtual output device.
+  share one virtual output device. `pair_of_key` routes a code to its pair.
+- `MSC_SCAN` aside, a key in no pair is passed through untouched; a key in a
+  pair is consumed and emits only that pair's v1/v2.
 - Every emitted `EV_KEY` write must be followed by an `EV_SYN`/`SYN_REPORT`
   before the next state-changing write, otherwise userspace sees coalesced
   events.
@@ -435,6 +443,46 @@ down in reverse order.
   configured device name) — every path that opens an input device has to
   keep going through this guard, in explicit mode too, or emitted events
   feed straight back in as input (infinite feedback loop).
+
+## Pairs
+
+- A PAIR IS THE OLD DAEMON, WHOLE. `keypair_t` is `{k1, k2, v1, v2, socd,
+  hid_k1, hid_k2}`; everything downstream of `pair_of_key` (digital) or the
+  per-pair depth rebuild in `analog_drain` (analog) is the single-pair code
+  run on that pair's state. `socd_apply` takes the pair rather than the
+  config, and nothing in the core, the front-end or the latch knows how many
+  pairs exist. If a change wants one pair to look at another, that is a
+  smell: pairs are independent by definition.
+- A ONE-PAIR CONFIG MUST BE EVENT-FOR-EVENT IDENTICAL to the pre-pairs
+  build. `keys:` (and top-level `socd`, `analog.hid_k1`/`hid_k2`) parse into
+  pair 0 exactly as before; that is what keeps the corpus and every recorded
+  trace meaningful. Checked when the branch was cut: `replay -e` identical to
+  `experiment/no-audio` on all 56 analysis traces and the corpus, under the
+  default, `-a deadline`, `-a report` and `-c` (252/252).
+- `analog_dev_t` is the BOARD (fd, format, ids) plus `analog_pair_t pair[]`,
+  one per analog-mode pair; `analog_pair_t` holds everything the latch
+  functions touch, plus `idx` into `cfg->pair[]`. A memset pair is pair 0,
+  which is what the tools' `fresh()` pattern relies on. Each report is read
+  and decoded once and handed to every pair in index order.
+- ONE TIMERFD SERVES EVERY PAIR: `analog_dev_deadline` is the earliest
+  pending deadline, `analog_dev_tick` ticks them all, and a pair whose window
+  has not run out ignores the tick exactly as one pair ignores an early one.
+- The analog THRESHOLDS are shared — they describe the board — and the HID
+  overrides are per pair.
+- `pairs_check` refuses a physical or virtual key in two pairs (cross-talk:
+  two machines on one key, or one pair releasing what another holds) and
+  k1 == k2 / v1 == v2 inside one. A pair's virtual MAY be another pair's
+  physical key; the output never comes back in.
+- KNOWN, by construction rather than by pairs: on an analog pair with no
+  debounce, both keys landing on the floor in ONE report arm the latch
+  before either press edge is routed, so the reconciliation presses one key
+  and the other gets a ZERO-LENGTH press (down and up in one report). Two
+  notes, never three, but a game may miss the short one. That is a taiko big
+  note; `latch_debounce_ms` > 0 keeps it on the plain remap. `regimetest`
+  case W pins both.
+- Coverage: `regimetest` W (two analog pairs through `analog_drain`, the
+  shared timer, the big note), X (two digital pairs through `process_event`,
+  the mixed board, `release_stuck`), Y (the config parser).
 
 ## What the audio excision took with it
 

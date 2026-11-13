@@ -162,34 +162,68 @@ typedef struct {
                                * backplate before `deep` arms. 0 == the
                                * first report with both planted arms it.
                                * Disarming is never debounced. */
-    int    hid_k1;        /* HID usage override; -1 == derive from the keymap */
-    int    hid_k2;
 } analog_config_t;
+
+/* One SOCD state machine: two physical keys driving two virtual ones, under
+ * its own mode. A config carries up to MAX_PAIRS of them, all on the one
+ * virtual keyboard and all independent - a pair never sees another pair's
+ * keys, which is the point (taiko: dons on one pair, kats on the other, a
+ * don and a kat together are two notes, not a rock). The analog thresholds
+ * are NOT per pair: they describe the board, and there is one board. */
+#define MAX_PAIRS 8
+
+typedef struct {
+    int k1, k2, v1, v2;
+    int socd;
+    int hid_k1;           /* HID usage override; -1 == derive from the keymap */
+    int hid_k2;
+} keypair_t;
 
 typedef struct {
     char   **device_paths;
     size_t   n_devices;
     int      auto_discover; /* no 'devices' list: scan for matching keyboards */
-    int      k1, k2, v1, v2;
-    int      socd;
+    keypair_t pair[MAX_PAIRS];
+    int      n_pairs;
     char    *uinput_name;
     analog_config_t analog;
 } oid_config_t;
 
+/* Any pair in analog mode? Opening the board, the debounce timer and the
+ * analog config check all hang off this rather than one global mode. */
+static int cfg_any_analog(const oid_config_t *c) {
+    for (int i = 0; i < c->n_pairs; i++)
+        if (c->pair[i].socd == SOCD_ANALOG)
+            return 1;
+    return 0;
+}
+
+/* The pair a -T trace records and `replay` replays: the first analog pair,
+ * or pair 0 when none is analog. A trace stays two keys wide - the corpus
+ * format - so with several pairs it is one pair's session, not all of them. */
+static int cfg_trace_pair(const oid_config_t *c) {
+    for (int i = 0; i < c->n_pairs; i++)
+        if (c->pair[i].socd == SOCD_ANALOG)
+            return i;
+    return 0;
+}
+
 static void config_init(oid_config_t *c) {
     memset(c, 0, sizeof(*c));
-    c->k1 = DEF_K1;
-    c->k2 = DEF_K2;
-    c->v1 = DEF_V1;
-    c->v2 = DEF_V2;
+    c->n_pairs        = 1;
+    c->pair[0].k1     = DEF_K1;
+    c->pair[0].k2     = DEF_K2;
+    c->pair[0].v1     = DEF_V1;
+    c->pair[0].v2     = DEF_V2;
+    c->pair[0].socd   = SOCD_TOGGLE;
+    c->pair[0].hid_k1 = -1;   /* sentinel: derive from the keymap */
+    c->pair[0].hid_k2 = -1;
     c->analog.travel_mm     = 4.0f;
     c->analog.actuation_mm  = 1.0f;
     c->analog.rt_enabled    = 1;
     c->analog.rt_press_mm   = 0.3f;
     c->analog.rt_release_mm = 0.3f;
     c->analog.bottom_out_mm = 0.20f;  /* 95% of the 4mm default travel */
-    c->analog.hid_k1        = -1;   /* sentinel: derive from the keymap */
-    c->analog.hid_k2        = -1;
 }
 
 static void config_free(oid_config_t *c) {
@@ -323,12 +357,6 @@ static int analog_config_check(const analog_config_t *a) {
                 (double)a->bottom_out_mm, (double)a->travel_mm);
         bad = 1;
     }
-    if (a->hid_k1 >= 0 && a->hid_k1 == a->hid_k2) {
-        LOG_ERR("'analog.hid_k1' and 'analog.hid_k2' are both 0x%02x: one "
-                "physical key would drive both virtual keys",
-                a->hid_k1);
-        bad = 1;
-    }
     if (bad)
         return -1;
 
@@ -378,6 +406,139 @@ static int parse_key_code(yaml_node_t *n, int *out) {
     if (code < 0) return -1;
     *out = code;
     return 0;
+}
+
+/* socd: "toggle"/"on", "snappy", "off" or "analog". */
+static int parse_socd(yaml_node_t *n, int *out) {
+    const char *s = n && n->type == YAML_SCALAR_NODE
+                    ? (const char *)n->data.scalar.value : "";
+    if (!strcasecmp(s, "toggle") || !strcasecmp(s, "on"))
+        *out = SOCD_TOGGLE;
+    else if (!strcasecmp(s, "snappy") || !strcasecmp(s, "snappy-tappy"))
+        *out = SOCD_SNAPPY;
+    else if (!strcasecmp(s, "off"))
+        *out = SOCD_OFF;
+    else if (!strcasecmp(s, "analog"))
+        *out = SOCD_ANALOG;
+    else
+        return -1;
+    return 0;
+}
+
+/* A HID usage override: "auto" (leave the -1 sentinel) or a usage id. */
+static int parse_hid(yaml_node_t *n, int *out) {
+    const char *s = n && n->type == YAML_SCALAR_NODE
+                    ? (const char *)n->data.scalar.value : "";
+    if (!strcasecmp(s, "auto"))
+        return 0;
+    char *end = NULL;
+    errno = 0;
+    long u = strtol(s, &end, 0);
+    if (end == s || *end != '\0' || errno != 0 || u < 0 || u > 0xFFFF)
+        return -1;
+    *out = (int)u;
+    return 0;
+}
+
+/* k1/k2/v1/v2 out of one mapping - `keys:` in the legacy spelling, or one
+ * entry of `pairs:`. `where` names it in errors. */
+static int parse_pair_keys(yaml_document_t *doc, yaml_node_t *map,
+                           keypair_t *p, const char *where) {
+    struct { const char *name; int *out; } kmap[] = {
+        { "k1", &p->k1 }, { "k2", &p->k2 },
+        { "v1", &p->v1 }, { "v2", &p->v2 },
+    };
+    for (size_t i = 0; i < sizeof(kmap)/sizeof(kmap[0]); i++) {
+        yaml_node_t *kn = map_get(doc, map, kmap[i].name);
+        if (kn && parse_key_code(kn, kmap[i].out) != 0) {
+            LOG_ERR("invalid key code for '%s.%s'", where, kmap[i].name);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* One entry of `pairs:`. Every key is required - there is no sensible
+ * default for a second pair's keys - except `socd`, which falls back to the
+ * top-level one, and the HID overrides. */
+static int parse_pair_entry(yaml_document_t *doc, yaml_node_t *map,
+                            keypair_t *p, int idx, int def_socd) {
+    char where[32];
+    snprintf(where, sizeof(where), "pairs[%d]", idx);
+    if (!map || map->type != YAML_MAPPING_NODE) {
+        LOG_ERR("'%s' must be a mapping", where);
+        return -1;
+    }
+    static const char *req[] = { "k1", "k2", "v1", "v2" };
+    for (size_t i = 0; i < sizeof(req)/sizeof(req[0]); i++)
+        if (!map_get(doc, map, req[i])) {
+            LOG_ERR("'%s.%s' is required", where, req[i]);
+            return -1;
+        }
+    p->socd   = def_socd;
+    p->hid_k1 = p->hid_k2 = -1;
+    if (parse_pair_keys(doc, map, p, where) != 0)
+        return -1;
+    yaml_node_t *sn = map_get(doc, map, "socd");
+    if (sn && parse_socd(sn, &p->socd) != 0) {
+        LOG_ERR("'%s.socd' must be \"toggle\"/\"on\", \"snappy\", "
+                "\"analog\", or \"off\"", where);
+        return -1;
+    }
+    static const struct { const char *key; size_t off; } hid[] = {
+        { "hid_k1", offsetof(keypair_t, hid_k1) },
+        { "hid_k2", offsetof(keypair_t, hid_k2) },
+    };
+    for (size_t i = 0; i < sizeof(hid)/sizeof(hid[0]); i++) {
+        yaml_node_t *v = map_get(doc, map, hid[i].key);
+        if (v && parse_hid(v, (int *)((char *)p + hid[i].off)) != 0) {
+            LOG_ERR("'%s.%s' must be \"auto\" or a HID usage id",
+                    where, hid[i].key);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Pairs are independent only if they share nothing. A physical key in two
+ * pairs would feed two machines; a virtual key in two would let one pair
+ * release what the other is holding. Either is a silent cross-talk bug, so
+ * both are refused. Within a pair the same holds - k1 == k2 is one key
+ * playing both halves of a rock. A pair's virtual MAY be another pair's
+ * physical key: the output never comes back in. */
+static int pairs_check(const oid_config_t *c) {
+    int bad = 0;
+    for (int i = 0; i < c->n_pairs; i++) {
+        const keypair_t *a = &c->pair[i];
+        if (a->k1 == a->k2) {
+            LOG_ERR("pair %d: k1 and k2 are the same key", i);
+            bad = 1;
+        }
+        if (a->v1 == a->v2) {
+            LOG_ERR("pair %d: v1 and v2 are the same key", i);
+            bad = 1;
+        }
+        if (a->hid_k1 >= 0 && a->hid_k1 == a->hid_k2) {
+            LOG_ERR("pair %d: hid_k1 and hid_k2 are both 0x%02x: one "
+                    "physical key would drive both virtual keys",
+                    i, a->hid_k1);
+            bad = 1;
+        }
+        for (int j = i + 1; j < c->n_pairs; j++) {
+            const keypair_t *b = &c->pair[j];
+            if (a->k1 == b->k1 || a->k1 == b->k2 ||
+                a->k2 == b->k1 || a->k2 == b->k2) {
+                LOG_ERR("pairs %d and %d share a physical key", i, j);
+                bad = 1;
+            }
+            if (a->v1 == b->v1 || a->v1 == b->v2 ||
+                a->v2 == b->v1 || a->v2 == b->v2) {
+                LOG_ERR("pairs %d and %d share a virtual key", i, j);
+                bad = 1;
+            }
+        }
+    }
+    return bad ? -1 : 0;
 }
 
 static int load_config(const char *path, oid_config_t *c) {
@@ -450,47 +611,61 @@ static int load_config(const char *path, oid_config_t *c) {
         }
     }
 
-    /* keys: optional mapping*/
-    yaml_node_t *keys = map_get(&doc, root, "keys");
-    if (keys) {
-        if (keys->type != YAML_MAPPING_NODE) {
-            LOG_ERR("'keys' must be a mapping");
-            goto out;
-        }
-        struct { const char *name; int *out; } kmap[] = {
-            { "k1", &c->k1 }, { "k2", &c->k2 },
-            { "v1", &c->v1 }, { "v2", &c->v2 },
-        };
-        for (size_t i = 0; i < sizeof(kmap)/sizeof(kmap[0]); i++) {
-            yaml_node_t *kn = map_get(&doc, keys, kmap[i].name);
-            if (kn && parse_key_code(kn, kmap[i].out) != 0) {
-                LOG_ERR("invalid key code for 'keys.%s'", kmap[i].name);
-                goto out;
-            }
-        }
-    }
-
-    /* socd: optional scalar */
+    /* socd: optional scalar - the mode of the legacy single pair, and the
+     * default for every `pairs:` entry that does not name its own. */
     if (map_get(&doc, root, "mode")) {
         LOG_ERR("'mode' has been renamed to 'socd'");
         goto out;
     }
+    int def_socd = SOCD_TOGGLE;
     yaml_node_t *socd = map_get(&doc, root, "socd");
-    if (socd) {
-        const char *s = socd->type == YAML_SCALAR_NODE
-                        ? (const char *)socd->data.scalar.value : "";
-        if (!strcasecmp(s, "toggle") || !strcasecmp(s, "on"))
-            c->socd = SOCD_TOGGLE;
-        else if (!strcasecmp(s, "snappy") || !strcasecmp(s, "snappy-tappy"))
-            c->socd = SOCD_SNAPPY;
-        else if (!strcasecmp(s, "off"))
-            c->socd = SOCD_OFF;
-        else if (!strcasecmp(s, "analog"))
-            c->socd = SOCD_ANALOG;
-        else {
-            LOG_ERR("'socd' must be \"toggle\"/\"on\", \"snappy\", "
-                    "\"analog\", or \"off\"");
+    if (socd && parse_socd(socd, &def_socd) != 0) {
+        LOG_ERR("'socd' must be \"toggle\"/\"on\", \"snappy\", "
+                "\"analog\", or \"off\"");
+        goto out;
+    }
+
+    /* keys / pairs. `keys:` is the single-pair spelling every existing
+     * config uses, and it stays exactly that: pair 0, with `socd` and
+     * `analog.hid_k1`/`hid_k2` as its mode and overrides. `pairs:` is the
+     * general form. Both at once is ambiguous about which is pair 0. */
+    yaml_node_t *keys  = map_get(&doc, root, "keys");
+    yaml_node_t *pairs = map_get(&doc, root, "pairs");
+    int legacy = !pairs;
+    if (keys && pairs) {
+        LOG_ERR("'keys' and 'pairs' are exclusive: 'keys' is the "
+                "single-pair spelling of 'pairs'");
+        goto out;
+    }
+    if (legacy) {
+        c->pair[0].socd = def_socd;
+        if (keys) {
+            if (keys->type != YAML_MAPPING_NODE) {
+                LOG_ERR("'keys' must be a mapping");
+                goto out;
+            }
+            if (parse_pair_keys(&doc, keys, &c->pair[0], "keys") != 0)
+                goto out;
+        }
+    } else {
+        if (pairs->type != YAML_SEQUENCE_NODE) {
+            LOG_ERR("'pairs' must be a sequence of mappings");
             goto out;
+        }
+        size_t n = (size_t)(pairs->data.sequence.items.top -
+                            pairs->data.sequence.items.start);
+        if (n == 0 || n > MAX_PAIRS) {
+            LOG_ERR("'pairs' must have between 1 and %d entries", MAX_PAIRS);
+            goto out;
+        }
+        c->n_pairs = 0;
+        for (yaml_node_item_t *it = pairs->data.sequence.items.start;
+             it < pairs->data.sequence.items.top; it++) {
+            if (parse_pair_entry(&doc, ynode(&doc, *it),
+                                 &c->pair[c->n_pairs], c->n_pairs,
+                                 def_socd) != 0)
+                goto out;
+            c->n_pairs++;
         }
     }
 
@@ -574,25 +749,26 @@ static int load_config(const char *path, oid_config_t *c) {
                          "while riding, the backplate itself is the switch "
                          "and no rapid trigger runs");
         }
+        /* The legacy pair's HID overrides. With `pairs:` they belong on
+         * each entry instead, and here they would be ambiguous. */
         static const struct { const char *key; size_t off; } hid[] = {
-            { "hid_k1", offsetof(analog_config_t, hid_k1) },
-            { "hid_k2", offsetof(analog_config_t, hid_k2) },
+            { "hid_k1", offsetof(keypair_t, hid_k1) },
+            { "hid_k2", offsetof(keypair_t, hid_k2) },
         };
         for (size_t i = 0; i < sizeof(hid) / sizeof(hid[0]); i++) {
             yaml_node_t *v = map_get(&doc, an, hid[i].key);
             if (!v) continue;
-            const char *s = v->type == YAML_SCALAR_NODE
-                            ? (const char *)v->data.scalar.value : "";
-            if (!strcasecmp(s, "auto")) continue;
-            char *end = NULL;
-            errno = 0;
-            long u = strtol(s, &end, 0);
-            if (end == s || *end != '\0' || errno != 0 || u < 0 || u > 0xFFFF) {
+            if (!legacy) {
+                LOG_ERR("'analog.%s' applies to the 'keys' spelling only; "
+                        "with 'pairs', put %s on the pair", hid[i].key,
+                        hid[i].key);
+                goto out;
+            }
+            if (parse_hid(v, (int *)((char *)&c->pair[0] + hid[i].off))) {
                 LOG_ERR("'analog.%s' must be \"auto\" or a HID usage id",
                         hid[i].key);
                 goto out;
             }
-            *(int *)((char *)&c->analog + hid[i].off) = (int)u;
         }
     }
 
@@ -614,8 +790,10 @@ static int load_config(const char *path, oid_config_t *c) {
         if (!c->uinput_name) { LOG_ERR("oom"); goto out; }
     }
 
+    if (pairs_check(c) != 0)
+        goto out;
     analog_config_resolve(&c->analog);
-    if (c->socd == SOCD_ANALOG && analog_config_check(&c->analog) != 0)
+    if (cfg_any_analog(c) && analog_config_check(&c->analog) != 0)
         goto out;
 
     rc = 0;
@@ -660,8 +838,10 @@ typedef struct {
     char             *path;
     dev_t             rdev; /* st_rdev, dedupes nodes reached via symlinks */
     int               grabbed; /* 0 = open but grab deferred (keys held) */
-    int               analog;  /* k1/k2 come from the analog path; drop them */
-    socd_state_t      socd;
+    int               analog;  /* this is the analog board: its analog-mode
+                                * pairs come from hidraw, so drop their
+                                * digital copies */
+    socd_state_t      socd[MAX_PAIRS]; /* one machine per pair, as configured */
 } input_dev_t;
 
 /* Grabbed devices as stable heap pointers: epoll user data points at the
@@ -714,17 +894,19 @@ static int is_doubletap_output(struct libevdev *dev, const oid_config_t *cfg) {
     return 0;
 }
 
-/* Auto-discovery filter: keyboard-shaped devices that advertise both
- * configured physical keys. Devices with pointer/absolute axes are
+/* Auto-discovery filter: keyboard-shaped devices that advertise every
+ * physical key of every pair - a board missing one pair's keys would run that
+ * pair's machine with half of it unreachable, so it is not grabbed at all. Devices with pointer/absolute axes are
  * rejected because the virtual device is key-only - grabbing a mouse
  * whose HID descriptor also claims keyboard keys (common on gaming mice)
  * would swallow its motion. Virtual devices (ours, keyd's, ...) are
  * rejected to stay loop-free among remappers. */
 static int auto_grab_ok(struct libevdev *dev, const oid_config_t *cfg) {
     if (libevdev_get_id_bustype(dev) == BUS_VIRTUAL) return 0;
-    if (!libevdev_has_event_code(dev, EV_KEY, (unsigned)cfg->k1) ||
-        !libevdev_has_event_code(dev, EV_KEY, (unsigned)cfg->k2))
-        return 0;
+    for (int i = 0; i < cfg->n_pairs; i++)
+        if (!libevdev_has_event_code(dev, EV_KEY, (unsigned)cfg->pair[i].k1) ||
+            !libevdev_has_event_code(dev, EV_KEY, (unsigned)cfg->pair[i].k2))
+            return 0;
     if (libevdev_has_event_type(dev, EV_REL) ||
         libevdev_has_event_type(dev, EV_ABS))
         return 0;
@@ -1296,16 +1478,15 @@ static int hid_map_from_any_keyboard(const char *input_dir,
     return found;
 }
 
-/* An open analog interface plus the SOCD state it drives. One per daemon:
- * the analog path owns k1/k2 outright, so a second analog board would only
- * fight the first over the same two virtual keys. */
+/* One analog-mode pair's machine: its two keys' front-ends, its SOCD state
+ * and its `deep` latch. Everything the latch functions touch lives here, so
+ * each pair arms, rides and disarms on its own two keys and nothing else -
+ * the latch rule stays a two-key test however many pairs there are. `idx`
+ * names the pair in cfg->pair[]; a memset one is pair 0, which is what the
+ * tools rely on. */
 typedef struct {
-    int            kind;        /* EP_ANALOG */
-    int            fd;
-    int            fmt;
-    uint16_t       vid, pid;
+    int            idx;         /* which cfg->pair[] this is */
     uint16_t       usage[2];    /* HID usage id of k1, k2 */
-    char           path[PATH_MAX];
     analog_state_t keys;
     socd_state_t   socd;
     int            deep;        /* 1 == both keys planted on the backplate;
@@ -1328,10 +1509,37 @@ typedef struct {
                                    * judge the debounce on reports alone, as
                                    * the daemon did before it had a timer.
                                    * See analog_deep_tick. */
+} analog_pair_t;
+
+/* An open analog interface plus the pairs it drives. One per daemon: the
+ * board is one device whatever is mapped on it, and a second analog board
+ * would only fight the first over the same virtual keys. Each report is read
+ * and decoded once here and handed to every pair. */
+typedef struct {
+    int            kind;        /* EP_ANALOG */
+    int            fd;
+    int            fmt;
+    uint16_t       vid, pid;
+    char           path[PATH_MAX];
+    analog_pair_t  pair[MAX_PAIRS];
+    int            n_pairs;
 } analog_dev_t;
 
+/* "pair N: " for log lines when there is more than one pair, and nothing
+ * when there is one, so a single-pair daemon logs exactly as it did. */
+static const char *pair_tag(const oid_config_t *cfg, int idx) {
+    static char buf[16];
+    if (cfg->n_pairs <= 1)
+        return "";
+    snprintf(buf, sizeof(buf), "pair %d: ", idx);
+    return buf;
+}
+
+/* Open the board and resolve the pairs it drives: every analog-mode pair, or
+ * with `only` >= 0 that one pair whatever its mode (-T records one pair, and
+ * passively, so its mode does not matter). */
 static analog_dev_t *analog_dev_open(const oid_config_t *cfg,
-                                     const char *input_dir) {
+                                     const char *input_dir, int only) {
     analog_dev_t *ad = calloc(1, sizeof(*ad));
     if (!ad) {
         LOG_ERR("oom");
@@ -1345,31 +1553,44 @@ static analog_dev_t *analog_dev_open(const oid_config_t *cfg,
         return NULL;
     }
 
-    /* Resolve k1/k2 to HID usage ids: an explicit config override wins,
-     * otherwise walk a keyboard's keymap for the mapping. */
+    /* Resolve each pair's k1/k2 to HID usage ids: an explicit config
+     * override wins, otherwise walk a keyboard's keymap for the mapping. */
     static uint16_t usage_of_key[KEY_MAX + 1];
-    if (cfg->analog.hid_k1 < 0 || cfg->analog.hid_k2 < 0)
-        hid_map_from_any_keyboard(input_dir, usage_of_key);
-
-    ad->usage[0] = cfg->analog.hid_k1 >= 0 ? (uint16_t)cfg->analog.hid_k1
-                                           : usage_of_key[cfg->k1];
-    ad->usage[1] = cfg->analog.hid_k2 >= 0 ? (uint16_t)cfg->analog.hid_k2
-                                           : usage_of_key[cfg->k2];
-    if (!ad->usage[0] || !ad->usage[1]) {
-        LOG_ERR("could not resolve k1/k2 to HID usage ids - run with -A to "
-                "find them, then set analog.hid_k1 / analog.hid_k2");
-        close(ad->fd);
-        free(ad);
-        return NULL;
+    int             walked = 0;
+    for (int i = 0; i < cfg->n_pairs; i++) {
+        const keypair_t *pc = &cfg->pair[i];
+        if (only >= 0 ? i != only : pc->socd != SOCD_ANALOG)
+            continue;
+        if ((pc->hid_k1 < 0 || pc->hid_k2 < 0) && !walked) {
+            hid_map_from_any_keyboard(input_dir, usage_of_key);
+            walked = 1;
+        }
+        analog_pair_t *ap = &ad->pair[ad->n_pairs];
+        ap->idx      = i;
+        ap->usage[0] = pc->hid_k1 >= 0 ? (uint16_t)pc->hid_k1
+                                       : usage_of_key[pc->k1];
+        ap->usage[1] = pc->hid_k2 >= 0 ? (uint16_t)pc->hid_k2
+                                       : usage_of_key[pc->k2];
+        if (!ap->usage[0] || !ap->usage[1]) {
+            LOG_ERR("%scould not resolve k1/k2 to HID usage ids - run with "
+                    "-A to find them, then set hid_k1 / hid_k2",
+                    pair_tag(cfg, i));
+            close(ad->fd);
+            free(ad);
+            return NULL;
+        }
+        ad->n_pairs++;
     }
 
     g_analog_vid = ad->vid;
     g_analog_pid = ad->pid;
 
-    LOG_INFO("Analog input on %s (%s, %04x:%04x): k1 -> hid 0x%02x, "
-             "k2 -> hid 0x%02x", ad->path,
-             ad->fmt == ANALOG_FMT_V2 ? "v2" : "v1", ad->vid, ad->pid,
-             ad->usage[0], ad->usage[1]);
+    LOG_INFO("Analog input on %s (%s, %04x:%04x)", ad->path,
+             ad->fmt == ANALOG_FMT_V2 ? "v2" : "v1", ad->vid, ad->pid);
+    for (int i = 0; i < ad->n_pairs; i++)
+        LOG_INFO("  %sk1 -> hid 0x%02x, k2 -> hid 0x%02x",
+                 pair_tag(cfg, ad->pair[i].idx),
+                 ad->pair[i].usage[0], ad->pair[i].usage[1]);
     LOG_INFO("Analog thresholds: actuation %.2fmm, release %.2fmm "
              "(derived), backplate at %.2fmm, rapid trigger %s, latch "
              "debounce %.1fms",
@@ -1438,9 +1659,10 @@ static void analog_dev_close(analog_dev_t *ad) {
  * it a new value here rather than reusing this one. */
 static int analog_trace(const oid_config_t *cfg, const char *config_path,
                         const char *input_dir) {
-    analog_dev_t *ad = analog_dev_open(cfg, input_dir);
+    analog_dev_t *ad = analog_dev_open(cfg, input_dir, cfg_trace_pair(cfg));
     if (!ad)
         return EXIT_FAILURE;
+    const analog_pair_t *tp = &ad->pair[0];
 
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -1476,7 +1698,8 @@ static int analog_trace(const oid_config_t *cfg, const char *config_path,
     printf("us,k1_mm,k2_mm\n");
     fflush(stdout);
 
-    LOG_INFO("Tracing k1/k2 travel to stdout. Play normally; Ctrl-C to stop.");
+    LOG_INFO("Tracing %sk1/k2 travel to stdout. Play normally; Ctrl-C to "
+             "stop.", pair_tag(cfg, tp->idx));
 
     unsigned long   lines   = 0;
 
@@ -1508,7 +1731,7 @@ static int analog_trace(const oid_config_t *cfg, const char *config_path,
         float depth[2] = { 0.0f, 0.0f };
         for (int i = 0; i < ns; i++)
             for (int k = 0; k < 2; k++)
-                if (s[i].code == ad->usage[k])
+                if (s[i].code == tp->usage[k])
                     depth[k] = s[i].depth * cfg->analog.travel_mm;
 
         printf("%lld,%.4f,%.4f\n", us, (double)depth[0], (double)depth[1]);
@@ -1668,8 +1891,10 @@ static int build_virtual(const oid_config_t *cfg) {
             continue;
         libevdev_enable_event_code(vdev, EV_KEY, code, NULL);
     }
-    libevdev_enable_event_code(vdev, EV_KEY, cfg->v1, NULL);
-    libevdev_enable_event_code(vdev, EV_KEY, cfg->v2, NULL);
+    for (int i = 0; i < cfg->n_pairs; i++) {
+        libevdev_enable_event_code(vdev, EV_KEY, cfg->pair[i].v1, NULL);
+        libevdev_enable_event_code(vdev, EV_KEY, cfg->pair[i].v2, NULL);
+    }
 
     int rc = libevdev_uinput_create_from_device(
         vdev, LIBEVDEV_UINPUT_OPEN_MANAGED, &uidev);
@@ -1717,7 +1942,7 @@ enum { S_NONE = 0, S_RELEASE = 1, S_SINGLE = 2, S_PRESS = 3 };
  * edges derived from travel depth. The transition logic is identical either
  * way, which is the point. */
 static void socd_apply(socd_state_t *in, int is_k1, int value, int mode,
-                       const oid_config_t *cfg) {
+                       const keypair_t *cfg) {
     in->mode = mode;
 
     if (mode == SOCD_OFF) {
@@ -1778,26 +2003,38 @@ static void socd_apply(socd_state_t *in, int is_k1, int value, int mode,
     }
 }
 
-/* evdev entry point: mirror everything that isn't k1/k2, and hand k1/k2 to
- * the SOCD core. In analog mode this device's k1/k2 are driven from travel
- * depth instead, so the digital copies are dropped here to avoid emitting
- * each press twice. */
+/* Which pair a key code belongs to, and whether it is that pair's k1.
+ * -1 when it is in none. pairs_check guarantees at most one match. */
+static int pair_of_key(const oid_config_t *cfg, unsigned code, int *is_k1) {
+    for (int i = 0; i < cfg->n_pairs; i++) {
+        if (code == (unsigned)cfg->pair[i].k1) { *is_k1 = 1; return i; }
+        if (code == (unsigned)cfg->pair[i].k2) { *is_k1 = 0; return i; }
+    }
+    return -1;
+}
+
+/* evdev entry point: mirror everything that isn't a pair key, and hand pair
+ * keys to that pair's SOCD core. On the analog board, an analog-mode pair is
+ * driven from travel depth instead, so its digital copies are dropped here to
+ * avoid emitting each press twice - but ONLY that pair's: a digital-mode pair
+ * on the same board has nobody else to drive it. */
 static void process_event(input_dev_t *in, const struct input_event *ie,
                           const oid_config_t *cfg) {
     if (ie->type == EV_MSC && ie->code == MSC_SCAN)
         return;
 
-    if (ie->type != EV_KEY ||
-        (ie->code != (unsigned)cfg->k1 && ie->code != (unsigned)cfg->k2)) {
+    int is_k1 = 0;
+    int p = ie->type == EV_KEY ? pair_of_key(cfg, ie->code, &is_k1) : -1;
+    if (p < 0) {
         libevdev_uinput_write_event(uidev, ie->type, ie->code, ie->value);
         return;
     }
 
-    if (in->analog)
+    if (in->analog && cfg->pair[p].socd == SOCD_ANALOG)
         return;
 
-    socd_apply(&in->socd, ie->code == (unsigned)cfg->k1, ie->value,
-               cfg->socd, cfg);
+    socd_apply(&in->socd[p], is_k1, ie->value, cfg->pair[p].socd,
+               &cfg->pair[p]);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1878,7 +2115,7 @@ static void socd_virtual_state(const int *held, int act, int mode,
  * them has to let go. The most recently pressed key keeps it: last input
  * wins, the same principle the core runs on. Which one keeps it does NOT
  * decide `act`; see analog_socd_edge. */
-static void analog_deep_set(analog_dev_t *ad, int on,
+static void analog_deep_set(analog_pair_t *ad, int on,
                             const oid_config_t *cfg) {
     /* Where the virtual keys stand comes from socd, which reflects the
      * edges already APPLIED. Where they should end up comes from the
@@ -1887,12 +2124,13 @@ static void analog_deep_set(analog_dev_t *ad, int on,
      * would press a key for a finger that left on this very sample, then
      * release it again when the edge lands: a phantom note on the way out
      * of a rock. */
+    const keypair_t *pc = &cfg->pair[ad->idx];
     int cur[2]  = { ad->socd.k1, ad->socd.k2 };
     int next[2] = { ad->keys.key[0].live, ad->keys.key[1].live };
     int from[2], to[2];
 
     socd_virtual_state(cur, ad->socd.act,
-                       ad->deep ? cfg->socd : SOCD_OFF, from);
+                       ad->deep ? pc->socd : SOCD_OFF, from);
 
     if (on) {
         int keep = ad->last_press;
@@ -1921,7 +2159,7 @@ static void analog_deep_set(analog_dev_t *ad, int on,
         next[0] = next[1] = 0;
     }
     ad->deep = on;
-    socd_virtual_state(next, ad->socd.act, on ? cfg->socd : SOCD_OFF, to);
+    socd_virtual_state(next, ad->socd.act, on ? pc->socd : SOCD_OFF, to);
 
     /* Emit the difference. BOTH directions are release-only now, which is
      * what the new disarm rule buys:
@@ -1938,7 +2176,7 @@ static void analog_deep_set(analog_dev_t *ad, int on,
     for (int k = 0; k < 2; k++) {
         if (from[k] == to[k]) continue;
         libevdev_uinput_write_event(uidev, EV_KEY,
-                                    k == 0 ? cfg->v1 : cfg->v2, to[k]);
+                                    k == 0 ? pc->v1 : pc->v2, to[k]);
         libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
     }
 }
@@ -1962,7 +2200,7 @@ static uint64_t analog_debounce_ns(const analog_config_t *a) {
 /* When a running latch debounce runs out, or 0 if none is running (no
  * plant pending, already armed, or the debounce is off and so never waits).
  * The daemon arms a timerfd on this; see analog_deep_tick. */
-static int analog_deep_deadline(const analog_dev_t *ad, const oid_config_t *cfg,
+static int analog_deep_deadline(const analog_pair_t *ad, const oid_config_t *cfg,
                                 uint64_t *deadline_ns) {
     if (ad->arm_on_report)
         return 0;
@@ -1974,7 +2212,7 @@ static int analog_deep_deadline(const analog_dev_t *ad, const oid_config_t *cfg,
 
 /* Arm the latch if the debounce has run out at `t_ns`. Shared by the
  * per-report test and the timer, so both arm identically. */
-static void analog_deep_try_arm(analog_dev_t *ad, const oid_config_t *cfg,
+static void analog_deep_try_arm(analog_pair_t *ad, const oid_config_t *cfg,
                                 uint64_t t_ns) {
     const analog_config_t *a = &cfg->analog;
     if (ad->deep || !ad->plant_pending)
@@ -1989,9 +2227,9 @@ static void analog_deep_try_arm(analog_dev_t *ad, const oid_config_t *cfg,
      * look identical from outside - which is exactly the question you
      * are asking when the daemon seems stuck on the plain remap.
      * Transitions are once per rock, not per report. */
-    LOG_INFO("Deep latch ARMED: k1 %.2fmm, k2 %.2fmm both at or past "
+    LOG_INFO("%sDeep latch ARMED: k1 %.2fmm, k2 %.2fmm both at or past "
              "the backplate (%.2fmm) for %.1fms - SOCD toggle engaged",
-             (double)ad->plant_mm[0], (double)ad->plant_mm[1],
+             pair_tag(cfg, ad->idx), (double)ad->plant_mm[0], (double)ad->plant_mm[1],
              (double)(a->travel_mm - a->bottom_out_mm),
              (double)(t_ns - ad->plant_ns) / 1e6);
     analog_deep_set(ad, 1, cfg);
@@ -2027,7 +2265,7 @@ static void analog_deep_try_arm(analog_dev_t *ad, const oid_config_t *cfg,
  * does not say predates the timer. Both callers come through here, and
  * analog_deep_deadline reports nothing to wait for, so the flag is the whole
  * of the old behaviour - analog_deep_update is the same code either way. */
-static void analog_deep_tick(analog_dev_t *ad, const oid_config_t *cfg,
+static void analog_deep_tick(analog_pair_t *ad, const oid_config_t *cfg,
                              uint64_t t_ns) {
     if (ad->arm_on_report)
         return;
@@ -2048,7 +2286,7 @@ static void analog_deep_tick(analog_dev_t *ad, const oid_config_t *cfg,
  * being reverted by a toggle on its way out: the release then lands as a
  * plain release, over virtual keys the reconciliation has already put where
  * SOCD_OFF expects them. */
-static void analog_deep_update(analog_dev_t *ad, const oid_config_t *cfg,
+static void analog_deep_update(analog_pair_t *ad, const oid_config_t *cfg,
                                const float *depth, uint64_t t_ns) {
     const analog_config_t *a = &cfg->analog;
 
@@ -2068,9 +2306,9 @@ static void analog_deep_update(analog_dev_t *ad, const oid_config_t *cfg,
          * burst is jitter, and "how completely you lift" is exactly the kind
          * of amplitude-driven rule this design already rejects elsewhere. */
         if (depth[0] < floor_mm && depth[1] < floor_mm) {
-            LOG_INFO("Deep latch cleared: k1 %.2fmm, k2 %.2fmm - both off "
+            LOG_INFO("%sDeep latch cleared: k1 %.2fmm, k2 %.2fmm - both off "
                      "the backplate (%.2fmm), back to the plain remap",
-                     (double)depth[0], (double)depth[1], (double)floor_mm);
+                     pair_tag(cfg, ad->idx), (double)depth[0], (double)depth[1], (double)floor_mm);
             analog_deep_set(ad, 0, cfg);
         }
         return;
@@ -2113,11 +2351,12 @@ static void analog_deep_update(analog_dev_t *ad, const oid_config_t *cfg,
 /* Route one synthesized edge into the SOCD core under whatever mode the
  * `deep` latch selects. The latch itself is resolved once per sample in
  * analog_drain, before any of that sample's edges are applied. */
-static void analog_socd_edge(analog_dev_t *ad, int is_k1, int value,
+static void analog_socd_edge(analog_pair_t *ad, int is_k1, int value,
                              const oid_config_t *cfg) {
     /* cfg->socd is SOCD_ANALOG here; socd_apply special-cases only OFF and
      * SNAPPY, so ANALOG runs the toggle path. Deliberate, not accidental. */
-    int mode = ad->deep ? cfg->socd : SOCD_OFF;
+    const keypair_t *pc = &cfg->pair[ad->idx];
+    int mode = ad->deep ? pc->socd : SOCD_OFF;
 
     /* `act` needs no lazy binding any more, and that is a consequence of the
      * backplate rule rather than a separate fix.
@@ -2138,7 +2377,7 @@ static void analog_socd_edge(analog_dev_t *ad, int is_k1, int value,
     if (value == 1)
         ad->last_press = is_k1 ? 0 : 1;
 
-    socd_apply(&ad->socd, is_k1, value, mode, cfg);
+    socd_apply(&ad->socd, is_k1, value, mode, pc);
 }
 
 /* Turn ONE report's worth of depths into SOCD edges. Split out of
@@ -2147,7 +2386,7 @@ static void analog_socd_edge(analog_dev_t *ad, int is_k1, int value,
  * resolution and the edge routing have to happen in this order, and a copy
  * in the tools would be free to drift from the daemon while still passing
  * its own assertions. */
-static void analog_report(analog_dev_t *ad, const oid_config_t *cfg,
+static void analog_report(analog_pair_t *ad, const oid_config_t *cfg,
                           const float *depth, uint64_t t_ns) {
     /* Feed both keys before judging either: engagement and lapse read the
      * deep/live state of BOTH, which is only complete once both have been
@@ -2204,20 +2443,49 @@ static int analog_drain(analog_dev_t *ad, const oid_config_t *cfg) {
         int             ns = analog_decode(ad->fmt, buf, (size_t)n, s,
                                            ANALOG_SLOTS);
 
-        float depth[2] = { 0.0f, 0.0f };
-        for (int i = 0; i < ns; i++)
-            for (int k = 0; k < 2; k++)
-                if (s[i].code == ad->usage[k])
-                    depth[k] = s[i].depth * cfg->analog.travel_mm;
-
-        analog_report(ad, cfg, depth, t_ns);
+        /* One report, every pair - in pair order, each on its own two
+         * keys. Pairs share no keys and no virtuals, so the order between
+         * them decides nothing but the order of writes within a report. */
+        for (int p = 0; p < ad->n_pairs; p++) {
+            analog_pair_t *ap = &ad->pair[p];
+            float depth[2] = { 0.0f, 0.0f };
+            for (int i = 0; i < ns; i++)
+                for (int k = 0; k < 2; k++)
+                    if (s[i].code == ap->usage[k])
+                        depth[k] = s[i].depth * cfg->analog.travel_mm;
+            analog_report(ap, cfg, depth, t_ns);
+        }
     }
     return 0;
 }
 
+/* The earliest running debounce deadline across the board's pairs - one
+ * timerfd serves them all - or 0 if none is running. */
+static int analog_dev_deadline(const analog_dev_t *ad, const oid_config_t *cfg,
+                               uint64_t *deadline_ns) {
+    int any = 0;
+    for (int p = 0; p < ad->n_pairs; p++) {
+        uint64_t dl;
+        if (analog_deep_deadline(&ad->pair[p], cfg, &dl) &&
+            (!any || dl < *deadline_ns)) {
+            *deadline_ns = dl;
+            any = 1;
+        }
+    }
+    return any;
+}
+
+/* The timer fired: tick every pair. A pair whose window has not run out
+ * yet ignores it, exactly as a single pair ignores an early tick. */
+static void analog_dev_tick(analog_dev_t *ad, const oid_config_t *cfg,
+                            uint64_t t_ns) {
+    for (int p = 0; p < ad->n_pairs; p++)
+        analog_deep_tick(&ad->pair[p], cfg, t_ns);
+}
+
 /* A device that dies while it holds k1/k2 would leave its active virtual
  * key stuck down forever; release it before dropping the device. */
-static void release_stuck(socd_state_t *in, const oid_config_t *cfg) {
+static void release_stuck(socd_state_t *in, const keypair_t *cfg) {
     if (!(in->k1 || in->k2))
         return;
     if (in->mode == SOCD_OFF) {
@@ -2259,10 +2527,10 @@ static void release_stuck(socd_state_t *in, const oid_config_t *cfg) {
 static void analog_reconcile(analog_dev_t **ad, analog_dev_t **adp,
                              const oid_config_t *cfg, dev_list_t *devs,
                              const char *input_dir, int epfd) {
-    if (cfg->socd != SOCD_ANALOG || *ad || devs->n == 0)
+    if (!cfg_any_analog(cfg) || *ad || devs->n == 0)
         return;
 
-    analog_dev_t *n = analog_dev_open(cfg, input_dir);
+    analog_dev_t *n = analog_dev_open(cfg, input_dir, -1);
     if (!n)
         return;
 
@@ -2295,7 +2563,7 @@ static void latch_timer_sync(int tfd, const analog_dev_t *ad,
         return;
     struct itimerspec its = { 0 };
     uint64_t          dl;
-    if (ad && analog_deep_deadline(ad, cfg, &dl)) {
+    if (ad && analog_dev_deadline(ad, cfg, &dl)) {
         its.it_value.tv_sec  = (time_t)(dl / 1000000000ull);
         its.it_value.tv_nsec = (long)(dl % 1000000000ull);
         if (!its.it_value.tv_sec && !its.it_value.tv_nsec)
@@ -2354,7 +2622,7 @@ static int run_loop(dev_list_t *devs, const oid_config_t *cfg,
      * it is not fatal - a still plant then arms on the next report, as it
      * used to. */
     int tfd = -1;
-    if (cfg->socd == SOCD_ANALOG && cfg->analog.latch_debounce_ms > 0.0f) {
+    if (cfg_any_analog(cfg) && cfg->analog.latch_debounce_ms > 0.0f) {
         tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
         struct epoll_event ev = { .events = EPOLLIN,
                                   .data = { .ptr = &g_ep_latch } };
@@ -2405,9 +2673,9 @@ static int run_loop(dev_list_t *devs, const oid_config_t *cfg,
                 if (ad) {
                     struct timespec now;
                     clock_gettime(CLOCK_MONOTONIC, &now);
-                    analog_deep_tick(ad, cfg,
-                                     (uint64_t)now.tv_sec * 1000000000ull +
-                                     (uint64_t)now.tv_nsec);
+                    analog_dev_tick(ad, cfg,
+                                    (uint64_t)now.tv_sec * 1000000000ull +
+                                    (uint64_t)now.tv_nsec);
                 }
                 latch_timer_sync(tfd, ad, cfg);
                 continue;
@@ -2420,7 +2688,9 @@ static int run_loop(dev_list_t *devs, const oid_config_t *cfg,
                     analog_drain(ad, cfg) < 0) {
                     LOG_WARN("analog device %s gone; falling back to the "
                              "digital path", ad->path);
-                    release_stuck(&ad->socd, cfg);
+                    for (int p = 0; p < ad->n_pairs; p++)
+                        release_stuck(&ad->pair[p].socd,
+                                      &cfg->pair[ad->pair[p].idx]);
                     epoll_ctl(epfd, EPOLL_CTL_DEL, ad->fd, NULL);
                     g_analog_vid = g_analog_pid = 0;
                     for (size_t d = 0; d < devs->n; d++)
@@ -2445,7 +2715,8 @@ static int run_loop(dev_list_t *devs, const oid_config_t *cfg,
             }
 
             if (dead) {
-                release_stuck(&in->socd, cfg);
+                for (int p = 0; p < cfg->n_pairs; p++)
+                    release_stuck(&in->socd[p], &cfg->pair[p]);
                 epoll_ctl(epfd, EPOLL_CTL_DEL, in->fd, NULL);
                 dev_list_remove(devs, in);
                 input_close(in);
@@ -2578,23 +2849,27 @@ main(int argc, char **argv) {
         return rc;
     }
 
-    const char *k1n = libevdev_event_code_get_name(EV_KEY, cfg.k1);
-    const char *k2n = libevdev_event_code_get_name(EV_KEY, cfg.k2);
-    const char *v1n = libevdev_event_code_get_name(EV_KEY, cfg.v1);
-    const char *v2n = libevdev_event_code_get_name(EV_KEY, cfg.v2);
     char devdesc[32];
     if (cfg.auto_discover)
         snprintf(devdesc, sizeof(devdesc), "auto-discover");
     else
         snprintf(devdesc, sizeof(devdesc), "%zu device(s)", cfg.n_devices);
-    LOG_INFO("Config: %s, keys k1=%s(%d) k2=%s(%d) "
-             "v1=%s(%d) v2=%s(%d), socd=%s",
-             devdesc,
-             k1n ? k1n : "?", cfg.k1, k2n ? k2n : "?", cfg.k2,
-             v1n ? v1n : "?", cfg.v1, v2n ? v2n : "?", cfg.v2,
-             cfg.socd == SOCD_SNAPPY ? "snappy"
-                 : cfg.socd == SOCD_OFF    ? "off"
-                 : cfg.socd == SOCD_ANALOG ? "analog" : "toggle");
+    LOG_INFO("Config: %s, %d pair%s", devdesc, cfg.n_pairs,
+             cfg.n_pairs == 1 ? "" : "s");
+    for (int i = 0; i < cfg.n_pairs; i++) {
+        const keypair_t *pc = &cfg.pair[i];
+        const char *k1n = libevdev_event_code_get_name(EV_KEY, pc->k1);
+        const char *k2n = libevdev_event_code_get_name(EV_KEY, pc->k2);
+        const char *v1n = libevdev_event_code_get_name(EV_KEY, pc->v1);
+        const char *v2n = libevdev_event_code_get_name(EV_KEY, pc->v2);
+        LOG_INFO("  %skeys k1=%s(%d) k2=%s(%d) v1=%s(%d) v2=%s(%d), socd=%s",
+                 pair_tag(&cfg, i),
+                 k1n ? k1n : "?", pc->k1, k2n ? k2n : "?", pc->k2,
+                 v1n ? v1n : "?", pc->v1, v2n ? v2n : "?", pc->v2,
+                 pc->socd == SOCD_SNAPPY ? "snappy"
+                     : pc->socd == SOCD_OFF    ? "off"
+                     : pc->socd == SOCD_ANALOG ? "analog" : "toggle");
+    }
 
 	/* use rt scheduler if we can */
     struct sched_param sp = { .sched_priority = 90 };
@@ -2621,8 +2896,8 @@ main(int argc, char **argv) {
     /* Open the analog interface before the first reconcile pass, so newly
      * grabbed keyboards already know their k1/k2 are analog-driven. */
     analog_dev_t *ad = NULL;
-    if (cfg.socd == SOCD_ANALOG) {
-        ad = analog_dev_open(&cfg, input_dir);
+    if (cfg_any_analog(&cfg)) {
+        ad = analog_dev_open(&cfg, input_dir, -1);
         if (!ad)
             LOG_WARN("Analog input unavailable - falling back to the "
                      "digital reverting toggle");

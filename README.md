@@ -130,6 +130,19 @@ uinput:
 #     bottom_out_mm: 0.2
 ```
 
+More than one pair of keys can run at once, each with its own state machine
+and mode. Replace `keys` with a `pairs` list (up to 8):
+
+```yaml
+pairs:                # osu!taiko: dons rock, kats remap
+  - { k1: KEY_F, k2: KEY_J, v1: KEY_F, v2: KEY_J, socd: analog }
+  - { k1: KEY_D, k2: KEY_K, v1: KEY_D, v2: KEY_K, socd: off }
+```
+
+Pairs are fully independent: no key may be in two pairs, and keys from
+different pairs never interact. `socd` on a pair defaults to the top-level
+one. See [`config.yaml`](config.yaml) for the details.
+
 After editing, restart the daemon:
 
 ```sh

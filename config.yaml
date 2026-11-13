@@ -46,6 +46,27 @@ keys:
   v1: KEY_Z
   v2: KEY_X
 
+# More than one pair. OPTIONAL, and instead of `keys` (not alongside it).
+# Each pair is its own state machine with its own mode, driving its own two
+# virtual keys; pairs never see each other's keys, so a key from one pair
+# and a key from another held together are two notes, never a rock. Up to
+# 8 pairs. Every pair needs k1/k2/v1/v2; `socd` defaults to the top-level
+# one above; hid_k1/hid_k2 (see `analog`) go on the pair rather than under
+# `analog`. No key, physical or virtual, may appear in two pairs. In
+# analog mode every analog pair has its own `deep` latch but shares the
+# thresholds below - they describe the board. Auto-discovery grabs only
+# keyboards that have every pair's keys.
+#
+# osu!taiko, dons rocking on the analog latch, kats on a plain remap:
+#
+# pairs:
+#   - { k1: KEY_F, k2: KEY_J, v1: KEY_F, v2: KEY_J, socd: analog }
+#   - { k1: KEY_D, k2: KEY_K, v1: KEY_D, v2: KEY_K, socd: off }
+#
+# For a big note (both keys of one colour at once) on an analog pair, set
+# a non-zero analog.latch_debounce_ms: the strike is an instant, so it
+# never arms the latch and both notes pass through as plain presses.
+
 # Analog mode (socd: analog). OPTIONAL - ignored by every other mode.
 #
 # Analog keyboards report how far each key is pressed, not just whether it
