@@ -1,4 +1,4 @@
-# doubletap configuration
+# evtrill configuration
 #
 # The daemon grabs keyboard devices (auto-discovered, or an explicit list),
 # runs a state machine over each configured pair of keys, and re-emits
@@ -10,15 +10,15 @@
 # not something to skip, so a typo stops the daemon instead of running it
 # on defaults.
 #
-# Copy this file to ~/.config/doubletap/config.yaml and edit it there;
+# Copy this file to ~/.config/evtrill/config.yaml and edit it there;
 # the daemon prefers that path over the installed copy in /usr/share.
 # After editing, restart the daemon:
-#   systemctl --user restart doubletap
+#   systemctl --user restart evtrill
 
 # Keyboard devices to grab. OPTIONAL. When omitted (or set to the scalar
 # "auto"), every keyboard-shaped device that has every pair's keys is grabbed
 # automatically: real keyboards only (no mice/touchpads, no other virtual
-# keyboards such as those created by keyd or doubletap itself).
+# keyboards such as those created by keyd or evtrill itself).
 #
 # To pin specific keyboards instead, list them explicitly. Use the stable
 # /dev/input/by-id/* paths so the entries survive replug
@@ -118,8 +118,8 @@ pairs:
 #
 # Rapid trigger (press_mm/release_mm) therefore applies to TAPPING only.
 #
-# Run `doubletapd -A` to watch live travel depth and pick numbers against
-# your own hands, or `doubletapd -T > s.csv` to record a session and replay
+# Run `evtrill -A` to watch live travel depth and pick numbers against
+# your own hands, or `evtrill -T > s.csv` to record a session and replay
 # it offline (see the replay tool). Recording your own alt-tapping and
 # checking that `replay` reports ZERO latches is the test that matters.
 #
@@ -156,4 +156,4 @@ pairs:
 
 # Identification of the virtual uinput keyboard.
 uinput:
-  name: "doubletap virtual keyboard"
+  name: "evtrill virtual keyboard"

@@ -1,5 +1,5 @@
 /*
- * doubletapd - Rapid-fire virtual keyboard daemon
+ * evtrill - Rapid-fire virtual keyboard daemon
  *
  * The daemon directly opens (and exclusively grabs) one or more evdev
  * keyboard devices - either an explicit config list or, by default,
@@ -66,11 +66,11 @@
 
 #define DEF_K1     KEY_Z
 #define DEF_K2     KEY_X
-#define DEF_NAME   "doubletap virtual keyboard"
+#define DEF_NAME   "evtrill virtual keyboard"
 
 /* Installed data path; CMake overrides this to match the install prefix. */
 #ifndef DEF_CONFIG
-#define DEF_CONFIG "/usr/share/doubletap/config.yaml"
+#define DEF_CONFIG "/usr/share/evtrill/config.yaml"
 #endif
 
 /* ------------------------------------------------------------------------- */
@@ -92,7 +92,7 @@ static void logf_(const char *level, const char *fmt, ...) {
     va_list ap;
     if (g_log_quiet && strcmp(level, "info") == 0)
         return;
-    fprintf(stderr, "[doubletapd] %s: ", level);
+    fprintf(stderr, "[evtrill] %s: ", level);
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
@@ -894,13 +894,13 @@ static int dev_list_has_rdev(const dev_list_t *l, dev_t rdev) {
  * process_event drop their digital k1/k2 so each press is emitted once. */
 static uint16_t g_analog_vid, g_analog_pid;
 
-/* Never grab a doubletap output device: grabbing our own uinput node (or
+/* Never grab an evtrill output device: grabbing our own uinput node (or
  * another instance's) feeds every emitted event straight back in as input -
  * an instant feedback loop. Applies in both explicit and auto mode. */
-static int is_doubletap_output(struct libevdev *dev, const oid_config_t *cfg) {
+static int is_evtrill_output(struct libevdev *dev, const oid_config_t *cfg) {
     const char *uniq = libevdev_get_uniq(dev);
     const char *name = libevdev_get_name(dev);
-    if (uniq && strcmp(uniq, "doubletap") == 0) return 1;
+    if (uniq && strcmp(uniq, "evtrill") == 0) return 1;
     if (name && strcmp(name, cfg->uinput_name) == 0) return 1;
     return 0;
 }
@@ -964,7 +964,7 @@ static input_dev_t *input_try_open(const char *path, const oid_config_t *cfg,
         return NULL;
     }
 
-    if (is_doubletap_output(dev, cfg) ||
+    if (is_evtrill_output(dev, cfg) ||
         (auto_mode && !auto_grab_ok(dev, cfg))) {
         libevdev_free(dev);
         close(fd);
@@ -1139,7 +1139,9 @@ static int analog_read_ids(const char *sysdir, uint16_t *vid, uint16_t *pid) {
     char path[PATH_MAX], line[256];
     int  found = -1;
 
-    snprintf(path, sizeof(path), "%s/device/uevent", sysdir);
+    int n = snprintf(path, sizeof(path), "%s/device/uevent", sysdir);
+    if (n < 0 || (size_t)n >= sizeof(path))
+        return -1;
     FILE *f = fopen(path, "re");
     if (!f) return -1;
     while (fgets(line, sizeof(line), f)) {
@@ -1712,7 +1714,7 @@ static int analog_trace(const oid_config_t *cfg, const char *config_path,
     clock_gettime(CLOCK_MONOTONIC, &t0);
     clock_gettime(CLOCK_REALTIME,  &t0_real);
 
-    printf("# doubletapd trace v1\n");
+    printf("# evtrill trace v1\n");
     printf("# travel_mm=%.4f\n", (double)cfg->analog.travel_mm);
     printf("# t0_monotonic_ns=%lld\n",
            (long long)t0.tv_sec * 1000000000LL + t0.tv_nsec);
@@ -1909,7 +1911,7 @@ static int build_virtual(const oid_config_t *cfg) {
         return -1;
     }
     libevdev_set_name(vdev, cfg->uinput_name);
-    libevdev_set_uniq(vdev, "doubletap");
+    libevdev_set_uniq(vdev, "evtrill");
     libevdev_set_id_bustype(vdev, BUS_VIRTUAL);
     libevdev_set_id_vendor (vdev, 0x0001);
     libevdev_set_id_product(vdev, 0x0001);
@@ -2783,7 +2785,7 @@ static int run_loop(dev_list_t *devs, const oid_config_t *cfg,
 
 static void print_usage(FILE *s, const char *prog) {
     fprintf(s,
-        "doubletapd - two-key trill daemon for rhythm games\n"
+        "evtrill - two-key trill daemon for rhythm games\n"
         "\n"
         "Grabs evdev keyboard devices, runs a state machine over each configured\n"
         "pair of keys, and re-emits everything via a single uinput virtual\n"
@@ -2810,7 +2812,7 @@ static void print_usage(FILE *s, const char *prog) {
         "                (default /dev/input; mainly for testing)\n"
         "\n"
         "Without -c, the config is looked up at\n"
-        "$XDG_CONFIG_HOME/doubletap/config.yaml (~/.config if unset),\n"
+        "$XDG_CONFIG_HOME/evtrill/config.yaml (~/.config if unset),\n"
         "falling back to %s.\n",
         prog, DEF_CONFIG);
 }
@@ -2823,12 +2825,12 @@ static const char *default_config_path(void) {
     int n;
 
     if (xdg && *xdg) {
-        n = snprintf(path, sizeof(path), "%s/doubletap/config.yaml", xdg);
+        n = snprintf(path, sizeof(path), "%s/evtrill/config.yaml", xdg);
     } else {
         const char *home = getenv("HOME");
         if (!home || !*home)
             return DEF_CONFIG;
-        n = snprintf(path, sizeof(path), "%s/.config/doubletap/config.yaml",
+        n = snprintf(path, sizeof(path), "%s/.config/evtrill/config.yaml",
                      home);
     }
     if (n < 0 || (size_t)n >= sizeof(path))
@@ -2915,7 +2917,7 @@ main(int argc, char **argv) {
     }
 
     /* Single virtual keyboard. Created before any grabs: device discovery
-     * runs inside run_loop and skips it via is_doubletap_output. */
+     * runs inside run_loop and skips it via is_evtrill_output. */
     if (build_virtual(&cfg) != 0) {
         config_free(&cfg);
         return EXIT_FAILURE;

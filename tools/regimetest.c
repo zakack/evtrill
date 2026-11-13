@@ -2,7 +2,7 @@
 /*
  * regimetest - assertions over the `deep` latch and its mode transitions.
  *
- * Includes doubletapd.c and stubs only the uinput writes, so it exercises
+ * Includes evtrill.c and stubs only the uinput writes, so it exercises
  * the daemon's own state machine rather than a copy. Depths are fed one
  * sample at a time exactly as analog_drain feeds them.
  *
@@ -15,8 +15,8 @@
 static void test_emit(unsigned type, unsigned code, int value);
 #define libevdev_uinput_write_event(d, t, c, v) test_emit((t), (c), (v))
 
-#define main doubletapd_main
-#include "doubletapd.c"
+#define main evtrill_main
+#include "evtrill.c"
 #undef main
 
 /* The codes the log names v1..v4: pair 0's keys, then pair 1's. A pair's

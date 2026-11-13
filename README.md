@@ -1,4 +1,4 @@
-# doubletap
+# evtrill
 
 A two-key trill daemon for rhythm games on Linux, turning a "rocking"
 two-finger pattern into rapid-fire, gap-free key alternation on any
@@ -7,7 +7,7 @@ Razer Snap Tap or Wooting Snappy Tappy.
 
 ![demo](docs/demo.gif)
 
-`doubletapd` exclusively grabs your keyboard(s) at the evdev level — before
+`evtrill` exclusively grabs your keyboard(s) at the evdev level — before
 Xorg/Wayland ever see the events — runs a state machine over each configured
 pair of keys, and re-emits everything through a single virtual uinput
 keyboard. A pair's keys keep their own codes; the daemon only changes when
@@ -43,7 +43,7 @@ they go down and up. All other keys pass through untouched.
 - **Low latency** — single-threaded epoll loop and best-effort `SCHED_FIFO`
   realtime scheduling.
 
-The whole thing is a single-file C11 daemon (`doubletapd.c`).
+The whole thing is a single-file C11 daemon (`evtrill.c`).
 
 ## Requirements
 
@@ -56,10 +56,10 @@ The whole thing is a single-file C11 daemon (`doubletapd.c`).
 
 ### Arch Linux
 
-Install `doubletap-git` with your AUR-helper of choice.
+Install `evtrill-git` with your AUR-helper of choice.
 
 ```sh
-yay -S doubletap-git
+yay -S evtrill-git
 ```
 
 ### From source
@@ -70,13 +70,13 @@ cmake --build build
 sudo cmake --install build
 ```
 
-This installs the `doubletapd` binary, the default config
-(`/usr/share/doubletap/`), a systemd **user** unit, and a udev rule that
+This installs the `evtrill` binary, the default config
+(`/usr/share/evtrill/`), a systemd **user** unit, and a udev rule that
 opens `/dev/uinput` to the `input` group.
 
 ## Setup
 
-`doubletapd` runs as an **unprivileged user service** — not as root.
+`evtrill` runs as an **unprivileged user service** — not as root.
 
 1. Add yourself to the `input` group (covers read access to
    `/dev/input/event*`; the packaged udev rule opens `/dev/uinput` to the
@@ -89,14 +89,14 @@ opens `/dev/uinput` to the `input` group.
 2. Copy the example config and edit it to taste:
 
    ```sh
-   mkdir -p ~/.config/doubletap
-   cp /usr/share/doubletap/config.yaml ~/.config/doubletap/
+   mkdir -p ~/.config/evtrill
+   cp /usr/share/evtrill/config.yaml ~/.config/evtrill/
    ```
 
 3. Enable the service:
 
    ```sh
-   systemctl --user enable --now doubletap
+   systemctl --user enable --now evtrill
    ```
 
 Optional: for `SCHED_FIFO` realtime scheduling, grant your user realtime
@@ -105,7 +105,7 @@ group). The daemon warns and falls back gracefully without it.
 
 ## Configuration
 
-Config is read from `~/.config/doubletap/config.yaml`
+Config is read from `~/.config/evtrill/config.yaml`
 (`$XDG_CONFIG_HOME` respected), falling back to the installed default.
 See the extensively commented [`config.yaml`](config.yaml) for the full
 schema. The short version:
@@ -122,7 +122,7 @@ pairs:                # required: the two keys of each pair
   - { keys: [KEY_Z, KEY_X] }   # KEY_* names or numeric codes
 
 uinput:
-  name: "doubletap virtual keyboard"
+  name: "evtrill virtual keyboard"
 
 # analog:             # only used by `mode: analog` — see below
 #   actuation_mm: 1.0
@@ -150,7 +150,7 @@ See [`config.yaml`](config.yaml) for the details.
 After editing, restart the daemon:
 
 ```sh
-systemctl --user restart doubletap
+systemctl --user restart evtrill
 ```
 
 ## Analog mode
@@ -272,12 +272,12 @@ input path. Whoever records plays on their own setup with their own keyboard
 behaving exactly as it normally does.
 
 ```sh
-./build/doubletapd -T > session.csv     # play, then Ctrl-C
+./build/evtrill -T > session.csv     # play, then Ctrl-C
 ./build/replay session.csv
 ```
 
 `replay` runs the recording back through the daemon's own analog state
-machine — it `#include`s `doubletapd.c` and stubs only the uinput writes, so
+machine — it `#include`s `evtrill.c` and stubs only the uinput writes, so
 it cannot drift from what the daemon actually does. It reports how many
 times `deep` armed, how many virtual presses were emitted, a histogram of
 how deep the keypresses actually went, and a sweep of latches against
@@ -295,7 +295,7 @@ the thresholds were in the header still read the config as they always did.
 check that it reports *zero* latches:
 
 ```sh
-./build/doubletapd -T > alttap.csv      # alt-tap a stream at speed
+./build/evtrill -T > alttap.csv      # alt-tap a stream at speed
 ./build/replay alttap.csv               # "0 deep latches" is the answer you want
 ```
 
@@ -313,7 +313,7 @@ past half travel cannot arm it at all, whatever their timing does.
 Run the analog monitor and watch your own travel depth:
 
 ```sh
-doubletapd -A
+evtrill -A
 ```
 
 It prints live depth per key and the peak depth of each press, grabs
@@ -349,7 +349,7 @@ but if a key comes out wrong you can pin them with the pair's `hid`, e.g.
 ## Running manually
 
 ```
-usage: doubletapd [-h] [-A|-T] [-c CONFIG] [-i DIR]
+usage: evtrill [-h] [-A|-T] [-c CONFIG] [-i DIR]
 
 options:
     -h          show this help and exit
@@ -366,7 +366,7 @@ options:
 Handy for trying config changes before restarting the service:
 
 ```sh
-./build/doubletapd -c config.yaml
+./build/evtrill -c config.yaml
 ```
 
 ## How it works
@@ -391,7 +391,7 @@ Handy for trying config changes before restarting the service:
 
 ## Development
 
-Two test tools `#include doubletapd.c` outright, so they exercise the
+Two test tools `#include evtrill.c` outright, so they exercise the
 daemon's real state machine rather than a copy that could drift. Both build
 as part of `all`, deliberately — the guarantee is worthless if the binaries
 can go stale.
@@ -404,7 +404,7 @@ can go stale.
 
 ## Fair play
 
-doubletapd rewrites your input below the game's view: what the game
+evtrill rewrites your input below the game's view: what the game
 receives is not literally what your fingers did. Some games, anti-cheat
 systems, and tournament rulesets prohibit SOCD-style input handling —
 Valve banned the equivalent keyboard-firmware features (Razer Snap Tap,

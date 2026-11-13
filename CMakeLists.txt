@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.13)
 
-project(doubletap VERSION 1.0.0 LANGUAGES C)
+project(evtrill VERSION 1.0.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -29,46 +29,46 @@ if(NOT UDEV_RULES_DIR)
     endif()
 endif()
 
-add_executable(doubletapd doubletapd.c)
+add_executable(evtrill evtrill.c)
 
-target_compile_definitions(doubletapd PRIVATE
-    DEF_CONFIG="${CMAKE_INSTALL_FULL_DATADIR}/doubletap/config.yaml"
+target_compile_definitions(evtrill PRIVATE
+    DEF_CONFIG="${CMAKE_INSTALL_FULL_DATADIR}/evtrill/config.yaml"
 )
 
-target_compile_options(doubletapd PRIVATE
+target_compile_options(evtrill PRIVATE
     -Wall -Wextra
     ${LIBEVDEV_CFLAGS_OTHER}
     ${LIBYAML_CFLAGS_OTHER}
 )
 
-target_include_directories(doubletapd PRIVATE
+target_include_directories(evtrill PRIVATE
     ${LIBEVDEV_INCLUDE_DIRS}
     ${LIBYAML_INCLUDE_DIRS}
 )
 
-target_link_directories(doubletapd PRIVATE
+target_link_directories(evtrill PRIVATE
     ${LIBEVDEV_LIBRARY_DIRS}
     ${LIBYAML_LIBRARY_DIRS}
 )
 
-target_link_libraries(doubletapd PRIVATE
+target_link_libraries(evtrill PRIVATE
     ${LIBEVDEV_LIBRARIES}
     ${LIBYAML_LIBRARIES}
 )
 
 # Developer tools. Not installed, but deliberately part of the default build:
-# each #includes doubletapd.c so it exercises the daemon's own state machine
+# each #includes evtrill.c so it exercises the daemon's own state machine
 # rather than a copy, and that guarantee is worthless if the binary can go
 # stale. EXCLUDE_FROM_ALL let `cmake --build build` skip them silently, which
 # produced a `replay` validating configs against rules the daemon no longer
 # had. A few seconds of build time is the cheaper mistake.
-#   ./build/replay TRACE.csv   replay a `doubletapd -T` recording
+#   ./build/replay TRACE.csv   replay a `evtrill -T` recording
 #   ./build/regimetest         assertions over the regime
 foreach(tool replay regimetest)
     add_executable(${tool} tools/${tool}.c)
 
     target_compile_definitions(${tool} PRIVATE
-        DEF_CONFIG="${CMAKE_INSTALL_FULL_DATADIR}/doubletap/config.yaml"
+        DEF_CONFIG="${CMAKE_INSTALL_FULL_DATADIR}/evtrill/config.yaml"
     )
     target_compile_options(${tool} PRIVATE
         -Wall -Wextra
@@ -86,11 +86,11 @@ foreach(tool replay regimetest)
     )
 endforeach()
 
-configure_file(doubletap.service.in doubletap.service @ONLY)
+configure_file(evtrill.service.in evtrill.service @ONLY)
 
-install(TARGETS doubletapd RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-install(FILES   config.yaml             DESTINATION ${CMAKE_INSTALL_DATADIR}/doubletap)
-install(FILES   ${CMAKE_CURRENT_BINARY_DIR}/doubletap.service
+install(TARGETS evtrill RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(FILES   config.yaml             DESTINATION ${CMAKE_INSTALL_DATADIR}/evtrill)
+install(FILES   ${CMAKE_CURRENT_BINARY_DIR}/evtrill.service
                                         DESTINATION ${SYSTEMD_USER_UNIT_DIR})
-install(FILES   70-doubletap-uinput.rules
+install(FILES   70-evtrill-uinput.rules
                                         DESTINATION ${UDEV_RULES_DIR})

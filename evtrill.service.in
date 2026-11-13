@@ -1,23 +1,23 @@
 [Unit]
-Description=doubletap SOCD-cleaning input daemon
-Documentation=https://github.com/zakack/doubletap
+Description=evtrill SOCD-cleaning input daemon
+Documentation=https://github.com/zakack/evtrill
 
 [Service]
 Type=simple
-ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/doubletapd
+ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/evtrill
 Restart=on-failure
 RestartSec=2s
 
 # This is a user unit: enable it with
-#   systemctl --user enable --now doubletap
+#   systemctl --user enable --now evtrill
 #
 # The daemon needs read access to /dev/input/event* and read/write access
 # to /dev/uinput. Both are covered by membership in the `input` group
 # (the packaged udev rule opens /dev/uinput to that group):
 #   sudo usermod -aG input $USER   # then log out and back in
 #
-# Config is read from ~/.config/doubletap/config.yaml, falling back to
-# @CMAKE_INSTALL_FULL_DATADIR@/doubletap/config.yaml.
+# Config is read from ~/.config/evtrill/config.yaml, falling back to
+# @CMAKE_INSTALL_FULL_DATADIR@/evtrill/config.yaml.
 
 [Install]
 WantedBy=default.target

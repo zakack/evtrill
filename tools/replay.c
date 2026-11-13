@@ -3,11 +3,11 @@
  * replay - run a recorded travel trace through the real analog state
  * machine, offline.
  *
- * Records come from `doubletapd -T`, which is passive: it opens the
+ * Records come from `evtrill -T`, which is passive: it opens the
  * keyboard's hidraw node and nothing else, so whoever recorded played on
  * their own setup with their own keyboard behaving normally.
  *
- * This includes doubletapd.c directly and stubs only the uinput writes, so
+ * This includes evtrill.c directly and stubs only the uinput writes, so
  * every decision here is made by the same code the daemon runs - not a
  * reimplementation that could drift from it.
  *
@@ -54,8 +54,8 @@
 static void replay_emit(unsigned type, unsigned code, int value);
 #define libevdev_uinput_write_event(d, t, c, v) replay_emit((t), (c), (v))
 
-#define main doubletapd_main
-#include "doubletapd.c"
+#define main evtrill_main
+#include "evtrill.c"
 #undef main
 
 /* ------------------------------------------------------------------------ */
@@ -200,7 +200,7 @@ static long long           g_origin_us;   /* the trace's first report */
  * `deep` BEFORE it writes the reconciling releases, so calling this ahead of
  * each write puts the latch row first - the releases are its consequence and
  * read that way. It runs again after every report for a flip that wrote
- * nothing. Hooked here rather than in doubletapd.c: the field is the truth,
+ * nothing. Hooked here rather than in evtrill.c: the field is the truth,
  * and the daemon needs no knowledge of this tool. */
 static void events_deep_sync(void) {
     if (!g_events || !g_ad || g_ad->deep == g_logged_deep)
@@ -675,7 +675,7 @@ int main(int argc, char **argv) {
          * replay prints. The origins say where that report sits on each
          * clock, so the stream can be lined up with a game's own log; they
          * are only known for an anchored trace. */
-        fprintf(g_events, "# doubletap replay events v1\n");
+        fprintf(g_events, "# evtrill replay events v1\n");
         fprintf(g_events, "# trace=%s\n", argv[optind]);
         fprintf(g_events, "# thresholds=%s\n",
                 as_played ? "recorded" : config_path);

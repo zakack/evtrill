@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`doubletapd` is a single-file C11 daemon that acts as a SOCD (Simultaneous
+`evtrill` is a single-file C11 daemon that acts as a SOCD (Simultaneous
 Opposing Cardinal Directions) cleaner for PAIRS of keyboard keys — one pair
 by default, up to `MAX_PAIRS` (8), each an independent machine. It exclusively
 grabs evdev keyboard devices at the kernel level (before Xorg/Wayland see
@@ -24,7 +24,7 @@ voice pool, trigger ring) was excised on this branch along with everything
 that existed to serve it — see "What the audio excision took with it" below
 before adding anything that looks like it is missing.
 
-The entire implementation lives in `doubletapd.c` (~2900 lines) — there is
+The entire implementation lives in `evtrill.c` (~2900 lines) — there is
 no multi-module structure.
 
 ## Build
@@ -34,7 +34,7 @@ cmake -S . -B build
 cmake --build build
 ```
 
-Produces `build/doubletapd`. Requires pkg-config-visible dev packages for
+Produces `build/evtrill`. Requires pkg-config-visible dev packages for
 `libevdev` and `yaml-0.1` (libyaml), and nothing else.
 
 There is no test suite, linter, or CI config in this repo — validate changes
@@ -44,18 +44,18 @@ by building and manually exercising the daemon (see Running below).
 
 The daemon is designed to run as an unprivileged user in the `input` group:
 that covers read access to `/dev/input/event*`, and the packaged udev rule
-(`70-doubletap-uinput.rules`) opens `/dev/uinput` to the same group. It
+(`70-evtrill-uinput.rules`) opens `/dev/uinput` to the same group. It
 has no need of root and should not be run as a root system service. The
-systemd unit (`doubletap.service.in`, configured by CMake) is a *user* unit:
-`systemctl --user enable --now doubletap`.
+systemd unit (`evtrill.service.in`, configured by CMake) is a *user* unit:
+`systemctl --user enable --now evtrill`.
 
 ```sh
-./build/doubletapd -c config.yaml
+./build/evtrill -c config.yaml
 ```
 
 Without `-c`, the daemon looks for
-`$XDG_CONFIG_HOME/doubletap/config.yaml` (`~/.config` if unset), then
-falls back to the installed default (`/usr/share/doubletap/config.yaml`;
+`$XDG_CONFIG_HOME/evtrill/config.yaml` (`~/.config` if unset), then
+falls back to the installed default (`/usr/share/evtrill/config.yaml`;
 CMake bakes the real prefix in via the `DEF_CONFIG` compile definition). See `config.yaml` for the schema: `devices` (optional list of
 `/dev/input/by-id/*` paths; omitted or `auto` means auto-discovery), `mode`
 (the default for every pair: `trill`, `last` or `analog`; default `trill`),
@@ -78,7 +78,7 @@ physical keys are consumed, so v != k was only ever a key remapper, which
 the game's keybinds and keyd/kanata already are). Wherever this file says
 "virtual key" or v1/v2, read "the pair's key as emitted". After
 editing config, restart via
-`systemctl --user restart doubletap`. The `-i DIR` flag overrides the
+`systemctl --user restart evtrill`. The `-i DIR` flag overrides the
 scanned/watched device directory (default `/dev/input`) — mainly for
 integration testing against a directory of symlinks to synthetic uinput
 nodes. The `-A` flag runs the analog monitor (live travel depth, no grab,
@@ -122,7 +122,7 @@ reuse `deadline`. The line sits after `# analog` deliberately — outside
 readers take the first eight header lines, and it must not push anything
 they look for past that.
 `tools/replay.c` consumes it — built as part of `all` (see below), and NOT
-installed. It `#include`s `doubletapd.c` and stubs only the uinput writes, so
+installed. It `#include`s `evtrill.c` and stubs only the uinput writes, so
 it exercises the daemon's real state machine rather than a copy that could
 drift; keep it that way.
 `analog_report` is the per-report path — feed, resolve the latch, route
@@ -149,18 +149,18 @@ virtual presses than physical.
 writes the session as CSV `us,event,value`: every virtual key transition
 AFTER the kernel's no-change filter, so it is what a reader of the device
 received, plus `deep,1`/`deep,0` rows for the latch. It is hooked in
-`replay_emit` and needs nothing from `doubletapd.c` — `analog_deep_set` flips
+`replay_emit` and needs nothing from `evtrill.c` — `analog_deep_set` flips
 `deep` before writing its reconciling releases, so checking the field ahead
 of each write puts the latch row first. Times count from the first report;
 for an anchored trace the header's `origin_*_ns` place that report on each
 clock. The sweep runs with the stream closed.
 
-Both tools build as part of `all`, deliberately: they `#include doubletapd.c`, and
+Both tools build as part of `all`, deliberately: they `#include evtrill.c`, and
 that guarantee is worthless if the binaries can go stale.
 
 ## Architecture
 
-Everything is in `doubletapd.c`, organized into clearly delimited
+Everything is in `evtrill.c`, organized into clearly delimited
 sections (search for the `/* --- */` banner comments):
 
 1. **Config** (`load_config` and friends) — parses YAML via libyaml's
@@ -176,8 +176,8 @@ sections (search for the `/* --- */` banner comments):
    it retries any configured path not currently open; in auto-discovery
    mode it scans `event*` nodes and grabs those passing `auto_grab_ok`
    (has both k1 and k2, no `EV_REL`/`EV_ABS`, not `BUS_VIRTUAL`). In BOTH
-   modes `is_doubletap_output` refuses any device whose uniq is
-   `"doubletap"` or whose name matches the configured uinput name —
+   modes `is_evtrill_output` refuses any device whose uniq is
+   `"evtrill"` or whose name matches the configured uinput name —
    grabbing our own output would be an instant feedback loop. If any key
    is physically down at open time (`any_key_down` — e.g. the Enter that
    launched the daemon), the grab is *deferred*: the fd stays open
@@ -259,7 +259,7 @@ sections (search for the `/* --- */` banner comments):
 `main()` wires these together: parse args -> load config -> attempt
 `SCHED_FIFO` realtime priority (best-effort, warns and falls back on
 failure) -> build the virtual device (safe
-before any grab: discovery skips it via `is_doubletap_output`) -> open the
+before any grab: discovery skips it via `is_evtrill_output`) -> open the
 analog interface if `socd: analog` (before the first reconcile, so grabbed
 keyboards already know their k1/k2 are analog-driven; a failure here just
 warns and falls back to `toggle`) -> install
@@ -450,8 +450,8 @@ down in reverse order.
   events.
 - `MSC_SCAN` events are dropped rather than mirrored; all other non-k1/k2
   events pass through untouched.
-- The daemon must never grab a doubletap output device
-  (`is_doubletap_output`, keyed on uinput uniq `"doubletap"` and the
+- The daemon must never grab an evtrill output device
+  (`is_evtrill_output`, keyed on uinput uniq `"evtrill"` and the
   configured device name) — every path that opens an input device has to
   keep going through this guard, in explicit mode too, or emitted events
   feed straight back in as input (infinite feedback loop).
